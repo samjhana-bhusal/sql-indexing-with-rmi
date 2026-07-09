@@ -45,16 +45,17 @@ private:
         InternalNode* z = new InternalNode();
         int t = B / 2;
         
-        // z gets the last t keys and child pointers of child
-        z->keys.assign(child->keys.begin() + t, child->keys.end());
-        child->keys.erase(child->keys.begin() + t, child->keys.end());
+        // z gets keys and children starting after index t
+        z->keys.assign(child->keys.begin() + t + 1, child->keys.end());
+        z->children.assign(child->children.begin() + t + 1, child->children.end());
         
-        z->children.assign(child->children.begin() + t, child->children.end());
-        child->children.erase(child->children.begin() + t, child->children.end());
-        
+        // Promoted key goes to parent
+        parent->keys.insert(parent->keys.begin() + index, child->keys[t]);
         parent->children.insert(parent->children.begin() + index + 1, z);
-        parent->keys.insert(parent->keys.begin() + index, z->keys.front());
-        z->keys.erase(z->keys.begin()); // The split key is promoted
+        
+        // child keeps first t keys and t+1 children
+        child->keys.erase(child->keys.begin() + t, child->keys.end());
+        child->children.erase(child->children.begin() + t + 1, child->children.end());
     }
 
     void split_leaf(InternalNode* parent, int index, LeafNode* leaf) {
