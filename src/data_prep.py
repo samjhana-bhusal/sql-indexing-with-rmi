@@ -96,9 +96,12 @@ def main():
     parser.add_argument("--distribution", type=str, default="lognormal", choices=["uniform", "normal", "lognormal", "clustered"], help="Distribution type for synthetic data")
     parser.add_argument("--num-keys", type=int, default=10000000, help="Number of keys to generate if synthetic")
     parser.add_argument("--out-dir", type=str, default="data", help="Output directory")
+    parser.add_argument("--run-id", type=str, default="", help="Run ID to store data separately")
     args = parser.parse_args()
     
-    os.makedirs(args.out_dir, exist_ok=True)
+    # Preprocessed output goes to out_dir/run_id
+    out_dir = os.path.join(args.out_dir, args.run_id) if args.run_id else args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
     
     keys = None
     if args.download:
@@ -125,8 +128,8 @@ def main():
     positions = np.arange(N, dtype=np.uint64)
     
     # Write preprocessed datasets
-    keys_out = os.path.join(args.out_dir, "keys.bin")
-    pos_out = os.path.join(args.out_dir, "positions.bin")
+    keys_out = os.path.join(out_dir, "keys.bin")
+    pos_out = os.path.join(out_dir, "positions.bin")
     
     print(f"Writing keys to {keys_out}...")
     with open(keys_out, 'wb') as f:
@@ -139,7 +142,7 @@ def main():
         f.write(positions.tobytes())
         
     # Write metadata
-    meta_out = os.path.join(args.out_dir, "metadata.txt")
+    meta_out = os.path.join(out_dir, "metadata.txt")
     print(f"Writing metadata to {meta_out}...")
     with open(meta_out, 'w') as f:
         f.write(f"N: {N}\n")
