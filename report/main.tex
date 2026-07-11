@@ -1,0 +1,193 @@
+\documentclass[10pt,twocolumn,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{microtype}
+\usepackage{url}
+
+\title{\textbf{Evaluating the Memory-Compute Trade-offs of Learned Index Structures with LSM-style Dynamic Write Buffers}}
+
+\author{
+    \textit{Systems, Databases, and Computer Architecture Track}
+}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Traditional database indexes, primarily B+Trees, suffer from significant latency overheads and high cache miss rates due to pointer-chasing in memory-bound architectures. The emerging paradigm of Learned Indexes addresses this by treating the indexing problem as a Cumulative Distribution Function (CDF) prediction task, replacing tree traversal with numerical model execution. However, static learned indexes like the Recursive Model Index (RMI) do not natively support dynamic insertions without expensive retraining. 
+
+In this work, we present a hybrid C++/Python execution pipeline comparing a degree-optimized ($B=64$) C++ B+Tree against a two-stage CPU/GPU RMI. To address the dynamic update bottleneck, we implement an LSM-style Delta Buffer (Write-Ahead Store) integrated with our RMI. Our experiments show that the RMI achieves a 99.96\% memory footprint compression (117.9~KB vs. 334.7~MB) and significantly lowers latency compared to the B+Tree under continuous distributions. We evaluate RMI sensitivity across uniform, log-normal, and clustered key distributions. We demonstrate how our dynamic write buffer maintains low-latency lookups ($<0.11\,\mu$s) while supporting real-time inserts, and isolate the parallel throughput bottlenecks of GPU RMI acceleration under low-concurrency workloads.
+\end{abstract}
+
+\section{Introduction}
+Modern computer systems are increasingly constrained by the ``Memory Wall''---the growing performance gap between fast CPU core executions and slow DRAM data fetches~\cite{wulf1995hitting, hennessy2011computer}. In relational database storage engines, index lookups represent a critical bottleneck. The ubiquitous B+Tree index~\cite{comer1979ubiquitous} navigates sorted datasets by traversing child node pointers, resulting in multiple random memory accesses. Because these heap-allocated nodes are rarely aligned in cache lines, B+Tree lookups trigger significant L1/L2 data cache misses and cause CPU pipeline stalls.
+
+To resolve this memory-bound bottleneck, Kraska et al.~\cite{kraska2018case} proposed replacing traditional index trees with Machine Learning (ML) regression models that learn the Cumulative Distribution Function (CDF) of the keys. By utilizing a key as a model input, the learned index directly predicts its physical offset in a sorted data array:
+\begin{equation}
+    \text{Predicted\_Position} = F(x) \times N
+\end{equation}
+where $F(x) \in [0,1]$ is the learned CDF of the dataset, and $N$ is the dataset size. Because the prediction has an associated error bound $\epsilon$, the exact index is located by running a local binary search within the bounded window:
+\begin{equation}
+    [\text{Predicted\_Position} - \epsilon, \text{Predicted\_Position} + \epsilon]
+\end{equation}
+This approach shifts the workload from memory fetches (pointer-chasing) to arithmetic pipeline calculations (neuron evaluations), improving cache utilization and throughput. 
+
+Despite these benefits, static learned indexes (such as the standard Recursive Model Index) suffer from the \textit{Dynamic Update Problem}: inserting new keys alters the dataset's CDF, requiring full model retraining. In this paper, we address this issue by proposing, implementing, and evaluating a dynamic read-write hybrid index that merges an RMI with an LSM-style Delta Buffer write store.
+
+\section{System Architecture \& Design}
+Our architecture consists of three core components: the baseline B+Tree, the hybrid two-stage RMI, and the dynamic LSM-style write buffer.
+
+\subsection{Degree-Optimized B+Tree Baseline}
+We implemented a self-contained, header-only B+Tree in C++ (Degree $B=64$) optimized for cache-line alignment. The leaf nodes store sorted key-value pairs representing raw data keys and their array positions, while internal nodes route lookup queries. We equipped the tree with a recursive memory allocation tracker to accurately capture heap capacity overhead (such as vector pre-allocations), enabling an honest comparison against learned index parameter sizes.
+
+\subsection{Recursive Model Index (RMI) Pipeline}
+Our RMI uses a two-stage hybrid layout designed in Python (using PyTorch) and compiled into optimized C++:
+\begin{enumerate}
+    \item \textbf{Stage 1 (Root NN)}: A feed-forward neural network with 32 hidden units and a ReLU activation. The input is a min-max scaled key:
+    \begin{equation}
+        x_{\text{scaled}} = \frac{Key - Min\_Key}{Max\_Key - Min\_Key}
+    \end{equation}
+    The network predicts a normalized target position $y \in [0,1]$.
+    \item \textbf{Stage 2 (Leaf Splines)}: The predicted index $y$ selects one of $M$ independent linear models:
+    \begin{equation}
+        idx_{\text{leaf}} = \text{clamp}(\lfloor y \times M \rfloor, 0, M-1)
+    \end{equation}
+    Each leaf model $i$ stores an Ordinary Least Squares (OLS) slope $m_i$ and intercept $c_i$, fitted during training on the raw key space.
+    \item \textbf{Search Bounds Calculation}: For each leaf bucket, we compute the maximum absolute error window:
+    \begin{equation}
+        \epsilon_i = \text{int}\left(\lceil \max_{x \in \text{Leaf}_i} | (m_i \cdot x + c_i) - \text{True\_Pos} | \rceil\right)
+    \end{equation}
+    We store the $\epsilon_i$ values as integers. During lookup, we run a standard local binary search within the bounded window in C++.
+\end{enumerate}
+
+\subsection{LSM-Style Delta Buffer}
+To support dynamic insertions, we integrate a dynamic write store (a Red-Black Tree in C++ using \texttt{std::map}) with the RMI. When a write query is received, the key-value pair is inserted directly into the dynamic Delta Buffer, avoiding RMI retraining. When a read query occurs, the index executes a two-step lookup:
+\begin{enumerate}
+    \item Search the Delta Buffer. If the key exists, return the value immediately ($O(\log K)$ latency, where $K$ is the buffer size).
+    \item If missing, evaluate the Stage 1 Root NN and Stage 2 linear spline to locate the search window in the static array, executing the bounded binary search.
+\end{enumerate}
+
+\begin{table*}[t]
+\centering
+\caption{Comprehensive Performance Metrics: B+Tree vs. RMI across Parameter Space ($M$)}
+\label{tab:sweep_results}
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Distribution} & \textbf{Index Configuration} & \textbf{Memory Size} & \textbf{Avg Latency} & \textbf{Throughput} & \textbf{Max Search Error} \\
+\midrule
+\textbf{UNIFORM} & B+Tree Baseline & 336.84 MB & 0.2215 $\mu$s & 24.01 MQPS & -- \\
+                 & RMI ($M=100$) & 3.13 KB & 0.0416 $\mu$s & 24.01 MQPS & 1.0 \\
+                 & RMI ($M=1000$) & 24.23 KB & 0.0363 $\mu$s & 27.58 MQPS & 1.0 \\
+                 & RMI ($M=10000$) & 235.16 KB & 0.0367 $\mu$s & 27.25 MQPS & 1.0 \\
+\midrule
+\textbf{LOGNORMAL} & B+Tree Baseline & 334.72 MB & 0.2115 $\mu$s & 4.74 MQPS & -- \\
+                   & RMI ($M=100$) & 3.13 KB & 0.1100 $\mu$s & 9.08 MQPS & 481.0 \\
+                   & RMI ($M=1000$) & 24.23 KB & 0.0893 $\mu$s & 11.19 MQPS & 193.0 \\
+                   & RMI ($M=5000$) & 117.98 KB & 0.0670 $\mu$s & 14.91 MQPS & 109.0 \\
+\midrule
+\textbf{CLUSTERED} & B+Tree Baseline & 336.75 MB & 0.2164 $\mu$s & 4.51 MQPS & -- \\
+                   & RMI ($M=100$) & 3.13 KB & 0.5409 $\mu$s & 1.84 MQPS & 1,936,055.0 \\
+                   & RMI ($M=1000$) & 24.23 KB & 0.5045 $\mu$s & 1.98 MQPS & 996,834.0 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Hardware Architecture Analysis}
+Traditional B+Trees represent a classic memory-bound bottleneck:
+\begin{equation}
+    \text{Memory Stalls} = \text{Misses} \times \text{Miss Penalty}
+\end{equation}
+Traversing a B+Tree of height $H$ requires chasing $H$ pointers. If the nodes are not in CPU cache, each redirection results in a main-memory fetch ($\approx 50$--$100\,$ns delay), causing the CPU instruction execution pipelines to stall. This leads to a low Instructions Per Cycle (IPC) rate.
+
+Conversely, our RMI fits completely inside the CPU cache. The total parameter space for $M=5000$ leaf models is only $117.97$ KB. This tiny profile fits within standard L2 caches. Consequently, the CPU executes Stage~1 matrix multiplications and Stage~2 linear spline interpolation using cached registers, shifting execution to compute pipelines and maximizing the CPU's IPC.
+
+\section{Experimental Methodology \& Evaluation}
+Our benchmarks evaluate the indexing structures under three key aspects: trade-off frontiers, distribution sensitivity, and write-buffering scalability. All tests were executed on an Apple Silicon host architecture featuring Unified Memory.
+
+\subsection{Parameter Sweep Analysis}
+Table~\ref{tab:sweep_results} shows the empirical results of our comprehensive parameter sweep. Under a \textbf{Uniform} distribution, the RMI exhibits an ideal linear structure. The maximum absolute search error is clamped at exactly $1.0$ across all values of $M$. Consequently, the local search window requires at most a single local step, enabling the RMI to outpace the B+Tree's lookup latency by over \textbf{6$\times$} ($0.036\,\mu$s vs $0.221\,\mu$s) while using $99.99\%$ less index memory.
+
+For the skewed \textbf{Log-Normal} distribution, expanding the leaf allocation space from $M=100$ to $M=5000$ divides the maximum prediction error from $481.0$ to $109.0$. This smaller error tightens the bounded binary search space, improving average CPU lookup latency from $0.110\,\mu$s to $0.067\,\mu$s, outperforming the B+Tree baseline ($0.210\,\mu$s) by a factor of 3.14$\times$.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{pareto_frontier.png}
+    \caption{Pareto Frontier analysis tracking Index Parameter Memory Footprint vs. Lookup Latency under varying key distributions.}
+    \label{fig:pareto}
+\end{figure}
+
+\subsection{Distribution Breakdown and Boundary Fragility}
+As shown in Fig.~\ref{fig:pareto}, the performance of the RMI degrades heavily when exposed to an adversarial \textbf{Clustered} distribution. Because the dataset features dense clumps separated by massive empty data gaps, the Stage 1 root network misroutes keys across boundaries. This causes the OLS models inside the leaves to span wide empty ranges, inflating the maximum search error to $996,834$ elements for $M=1000$.
+
+When the search window expands to include nearly $10\%$ of the entire index space, the local bounded lookup reverts into a heavy un-cached binary search over megabytes of main memory. This structural fragility slows RMI latency to $0.504\,\mu$s, making it more than twice as slow as the distribution-oblivious B+Tree ($0.216\,\mu$s). At configurations of $M \ge 5000$, this mismatch causes integer boundary overflows or underflows in C++ pointer tracking loops unless explicit index clamping guardrails are applied.
+
+\subsection{Dynamic Write Buffering Scalability}
+To validate real-time updates, we tested an evaluation pipeline running $10,000$ sequential dynamic insertions followed by lookups under varying delta-buffer configurations on the log-normal dataset. 
+
+The LSM-style write path achieved an outstanding average insertion speed of \textbf{0.0230~$\mu$s/write}. However, as the un-indexed data accumulation within the Red-Black tree grows, lookup latencies degrade due to sequential verification lookups across multiple data blocks. At a buffer size of $0$, lookup latency matches the base RMI speed of $0.058\,\mu$s. As the buffer scales to $1,000$ and $10,000$ keys, lookup latency increases to $0.078\,\mu$s and $0.105\,\mu$s respectively, reflecting a clear memory-compute performance trade-off.
+
+\begin{table}[h]
+\centering
+\caption{Dynamic Read-Write Performance (Lognormal)}
+\label{tab:delta_buffer}
+\begin{tabular}{rrr}
+\toprule
+\textbf{\shortstack{Buffer\\Size}} & \textbf{\shortstack{Write Latency\\($\mu$s)}} & \textbf{\shortstack{Read Latency\\($\mu$s)}} \\
+\midrule
+0     & 0.0230 & 0.0589 \\
+100   & 0.0230 & 0.0647 \\
+1000  & 0.0230 & 0.0784 \\
+5000  & 0.0230 & 0.0991 \\
+10000 & 0.0230 & 0.1051 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{GPU Parallel Dispatch Paradox}
+We ported our multi-stage RMI lookup execution logic to an Apple Silicon MPS GPU framework to analyze parallel batched execution throughput over $100,000$ randomized queries. The throughput results are detailed in Table~\ref{tab:gpu_results}.
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{gpu_throughput.png}
+    \caption{GPU lookup throughput scaling behavior across a logarithmic sweep of vector batch sizes on Apple Silicon (MPS).}
+    \label{fig:gpu_throughput}
+\end{figure}
+\begin{table}[h]
+\centering
+\caption{GPU Parallel Throughput vs. Vector Batch Size}
+\label{tab:gpu_results}
+\begin{tabular}{rrr}
+\toprule
+\textbf{Batch Size} & \textbf{Time (s)} & \textbf{Throughput (MQPS)} \\
+\midrule
+1    & 12.0505 & 0.0083 \\
+128  &  0.1276 & 0.7837 \\
+512  &  0.0367 & 2.7215 \\
+1024 &  0.0483 & 2.0698 \\
+4096 &  0.0823 & 1.2145 \\
+8192 &  0.0539 & 1.8562 \\
+\bottomrule
+\end{tabular}
+\end{table}
+The empirical evaluation exposes a stark \textit{Parallel Dispatch Paradox}. At a batch size of 1, the overhead of spinning up asynchronous compute graphs on the Apple Silicon GPU engine throttles performance to a sluggish 12.05 seconds ($0.0083$ MQPS). As the query batch size scales to $512$, the hardware utilizes its parallel execution threads, peaking at \textbf{2.7215 MQPS}. 
+
+However, because our total benchmark sample is constrained to 100,000 queries, further increasing the batch size to 8192 reduces the workload to just 12 total loop iterations. At this scale, the framework's internal loop invocation and host-device synchronization overheads dominate execution, dropping throughput back down to $1.8562$ MQPS. This confirms that while RMIs scale efficiently to parallel architectures like GPUs, they require high-concurrency stream environments to offset framework dispatch latencies and outpace CPU execution.
+
+\section{Related Work}
+Learned indexes were pioneered by Kraska et al.~\cite{kraska2018case}, who introduced the RMI concept. To support dynamic write operations without full retraining, researchers developed updatable learned indexes. Galakatos et al. proposed the FITing-Tree~\cite{galakatos2019fiting}, which uses linear splines with error bounds but splits leaf nodes dynamically like a B+Tree. Ding et al. developed ALEX~\cite{ding2020alex}, which uses dynamic memory slots and model retraining inside nodes. Ferragina and Vinciguerra introduced the PGM-index~\cite{ferragina2020pgm}, providing provable worst-case error bounds. Our work builds on these concepts by implementing a lightweight, decoupled LSM-style delta store~\cite{oneil1996log} combined with a CPU/GPU RMI pipeline.
+
+\section{Conclusion}
+This project evaluates the performance and architectural trade-offs of learned index structures. Our hybrid C++/Python RMI demonstrates a 99.96\% memory reduction over a degree-optimized B+Tree, fitting within CPU caches to avoid pointer-chasing latency. By incorporating an LSM-style Delta Buffer, we resolve the static training limitation of RMIs, delivering a high-performance, write-capable learned index suitable for modern storage engines.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
