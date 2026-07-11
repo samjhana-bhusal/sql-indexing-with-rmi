@@ -112,28 +112,32 @@ inline double predict_pos(uint64_t key, const RMIParams& params, uint64_t& leaf_
 }
 
 int main(int argc, char* argv[]) {
-    std::string run_dir = "data";
-    if (argc > 1) {
-        run_dir = argv[1];
-    }
+    // argv[1] = directory containing keys.bin + positions.bin
+    // argv[2] = directory containing rmi_params.bin (also where results are written)
+    //           defaults to data_dir if not provided
+    std::string data_dir   = "data";
+    std::string params_dir = "data";
+    if (argc > 1) data_dir   = argv[1];
+    if (argc > 2) params_dir = argv[2];
+    else          params_dir = data_dir;
     
-    std::string keys_path   = run_dir + "/keys.bin";
-    std::string pos_path    = run_dir + "/positions.bin";
-    std::string params_path = run_dir + "/rmi_params.bin";
+    std::string keys_path   = data_dir   + "/keys.bin";
+    std::string pos_path    = data_dir   + "/positions.bin";
+    std::string params_path = params_dir + "/rmi_params.bin";
     
     std::vector<uint64_t> keys;
     std::vector<uint64_t> positions;
     RMIParams params;
     
-    std::cout << "Loading dataset binaries from " << run_dir << "..." << std::endl;
+    std::cout << "Loading keys/positions from: " << data_dir << std::endl;
     if (!load_binary_file(keys_path, keys) || !load_binary_file(pos_path, positions)) {
-        std::cerr << "Error: Could not load data files from: " << run_dir << std::endl;
+        std::cerr << "Error: Could not load data files from: " << data_dir << std::endl;
         return 1;
     }
     
-    std::cout << "Loading RMI parameters from " << run_dir << "..." << std::endl;
+    std::cout << "Loading RMI params from: " << params_dir << std::endl;
     if (!load_rmi_params(params_path, params)) {
-        std::cerr << "Error: Could not load RMI params from: " << run_dir << std::endl;
+        std::cerr << "Error: Could not load RMI params from: " << params_dir << std::endl;
         return 1;
     }
     
@@ -211,8 +215,8 @@ int main(int argc, char* argv[]) {
     std::cout << "  Average Latency:   " << avg_latency_us << " us/query" << std::endl;
     std::cout << "  Throughput:        " << throughput_mqps << " Million queries/sec" << std::endl;
     
-    // Write results to file for Phase 5 comparison
-    std::ofstream out(run_dir + "/rmi_results.txt");
+    // Results written to params_dir so each M_N config keeps its own results
+    std::ofstream out(params_dir + "/rmi_results.txt");
     if (out) {
         out << "memory_bytes: " << rmi_mem_bytes << "\n";
         out << "avg_latency_us: " << avg_latency_us << "\n";

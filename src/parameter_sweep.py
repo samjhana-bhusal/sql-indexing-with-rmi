@@ -26,7 +26,12 @@ def parse_results_file(path):
 
 def main():
     print("==========================================================")
-    # 1. Compile binaries
+    run_id = f"sweep_{time.strftime('%Y%m%d_%H%M%S')}"
+    base_run_dir = os.path.join("data", run_id)
+    os.makedirs(base_run_dir, exist_ok=True)
+    print(f"Global sweep session root directory: {base_run_dir}")
+    print("==========================================================")
+
     print("Compiling C++ benchmarks...")
     if not run_cmd(["make"]):
         print("Compilation failed.")
@@ -35,8 +40,6 @@ def main():
     distributions = ["uniform", "lognormal", "clustered"]
     leaf_counts = [100, 500, 1000, 5000, 10000]
     
-    # Store all data
-    # { dist: { "btree": {mem, lat}, "rmi": [ {M, mem, lat, max_err, mean_err} ] } }
     sweep_data = {}
     
     for dist in distributions:
@@ -46,29 +49,48 @@ def main():
         
         sweep_data[dist] = {"btree": None, "rmi": []}
         
-        # A. Preprocess data for this distribution (10M keys)
-        print(f"Generating data ({dist})...")
-        if not run_cmd(["python3", "src/data_prep.py", "--distribution", dist, "--num-keys", "10000000"]):
+        # Isolate by distribution inside our parent run session
+        dist_dir = os.path.join(base_run_dir, dist)
+        os.makedirs(dist_dir, exist_ok=True)
+        
+        # A. Preprocess data uniquely for this distribution branch
+        # data_prep writes keys.bin/positions.bin directly into dist_dir
+        if not run_cmd(["python3", "src/data_prep.py",
+                        "--distribution", dist,
+                        "--num-keys", "10000000",
+                        "--out-dir", base_run_dir,
+                        "--run-id", dist]):
             continue
             
-        # B. Run B+Tree baseline
+        # B. Run B+Tree baseline (Pass isolated dist directory to C++)
         print("Running B+Tree baseline...")
-        if run_cmd(["./btree_benchmark"]):
-            btree_metrics = parse_results_file("data/btree_results.txt")
+        if run_cmd(["./btree_benchmark", dist_dir]):
+            btree_metrics = parse_results_file(os.path.join(dist_dir, "btree_results.txt"))
             sweep_data[dist]["btree"] = btree_metrics
-            print(f"  B+Tree Memory: {btree_metrics.get('memory_bytes', 0)/1024/1024:.2f} MB | Latency: {btree_metrics.get('avg_latency_us', 0):.4f} us")
+            if btree_metrics:
+                print(f"  B+Tree Memory: {btree_metrics.get('memory_bytes', 0)/1024/1024:.2f} MB | Latency: {btree_metrics.get('avg_latency_us', 0):.4f} us")
             
         # C. Loop over Leaf count M for RMI
         for M in leaf_counts:
             print(f"\n--- Training RMI with M={M} ({dist}) ---")
-            # Train RMI with 8 epochs for faster sweep speed
-            if not run_cmd(["python3", "src/train_rmi.py", "--num-leaves", str(M), "--epochs", "8"]):
+            
+            # Isolate model checkpoint configs to prevent overwrites across configuration sweeps
+            config_dir = os.path.join(dist_dir, f"M_{M}")
+            os.makedirs(config_dir, exist_ok=True)
+            
+            # Point training script to the structural keys generated under the active dist_dir
+            if not run_cmd(["python3", "src/train_rmi.py", 
+                            "--keys", os.path.join(dist_dir, "keys.bin"), 
+                            "--positions", os.path.join(dist_dir, "positions.bin"), 
+                            "--num-leaves", str(M), 
+                            "--out-dir", config_dir]):
                 continue
                 
             print(f"Running CPU RMI benchmark for M={M}...")
-            if run_cmd(["./rmi_benchmark"]):
-                rmi_metrics = parse_results_file("data/rmi_results.txt")
-                err_metrics = parse_results_file("data/rmi_error_stats.txt")
+            # rmi_benchmark argv[1]=data dir (keys/positions), argv[2]=config dir (params + results)
+            if run_cmd(["./rmi_benchmark", dist_dir, config_dir]):
+                rmi_metrics = parse_results_file(os.path.join(config_dir, "rmi_results.txt"))
+                err_metrics = parse_results_file(os.path.join(config_dir, "rmi_error_stats.txt"))
                 
                 combined = {
                     "M": M,
@@ -84,38 +106,27 @@ def main():
     # 2. Generate Pareto Frontier Plot
     print("\nGenerating Pareto Frontier Plot...")
     plt.figure(figsize=(10, 6))
-    
     colors = {"uniform": "#2ca02c", "lognormal": "#1f77b4", "clustered": "#d62728"}
     markers = {"uniform": "^", "lognormal": "o", "clustered": "s"}
     
-    # Plot RMI Curves
     for dist in distributions:
         rmi_results = sweep_data[dist]["rmi"]
         if not rmi_results:
             continue
-            
         m_vals = [r["M"] for r in rmi_results]
-        # Memory in KB
         mem_kb = [r["memory_bytes"] / 1024.0 for r in rmi_results]
         latencies = [r["avg_latency_us"] for r in rmi_results]
         
-        plt.plot(mem_kb, latencies, label=f"RMI - {dist.capitalize()}", 
-                 color=colors[dist], marker=markers[dist], linewidth=2)
-        
-        # Annotate M values
+        plt.plot(mem_kb, latencies, label=f"RMI - {dist.capitalize()}", color=colors[dist], marker=markers[dist], linewidth=2)
         for i, M in enumerate(m_vals):
-            plt.annotate(f"M={M}", (mem_kb[i], latencies[i]), textcoords="offset points", 
-                         xytext=(0,10), ha='center', fontsize=8, alpha=0.7)
+            plt.annotate(f"M={M}", (mem_kb[i], latencies[i]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8, alpha=0.7)
 
-    # Plot B+Tree reference points (usually flat across distributions)
-    # B+Tree memory is around 150-200 MB, so we plot it at the right side of the graph
     for dist in distributions:
         btree = sweep_data[dist]["btree"]
         if btree:
             bt_mem_kb = btree["memory_bytes"] / 1024.0
             bt_lat = btree["avg_latency_us"]
-            plt.scatter([bt_mem_kb], [bt_lat], color=colors[dist], marker="X", s=100, 
-                        label=f"B+Tree - {dist.capitalize()}", edgecolors='black', zorder=5)
+            plt.scatter([bt_mem_kb], [bt_lat], color=colors[dist], marker="X", s=100, label=f"B+Tree - {dist.capitalize()}", edgecolors='black', zorder=5)
 
     plt.xscale('log')
     plt.xlabel('Index Parameter Footprint (KB, Log Scale)', fontsize=12)
@@ -124,55 +135,26 @@ def main():
     plt.grid(True, which="both", ls="--", alpha=0.5)
     plt.legend(loc="best", frameon=True, shadow=True)
     
-    # Save the Pareto Frontier plot
-    plot_path = "data/pareto_frontier.png"
+    plot_path = os.path.join(base_run_dir, "pareto_frontier.png")
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    print(f"Pareto Frontier plot saved to {plot_path}.")
+    plt.close()
     
-    # 3. Generate Error Bounding Reduction Plot
-    plt.figure(figsize=(10, 6))
-    for dist in distributions:
-        rmi_results = sweep_data[dist]["rmi"]
-        if not rmi_results:
-            continue
-        m_vals = [r["M"] for r in rmi_results]
-        max_errors = [r["max_error"] for r in rmi_results]
-        plt.plot(m_vals, max_errors, label=f"{dist.capitalize()} (Max Error)", 
-                 color=colors[dist], marker=markers[dist], linewidth=2)
-                 
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xlabel('Number of Leaf Models (M, Log Scale)', fontsize=12)
-    plt.ylabel('Max Prediction Error (epsilon, Log Scale)', fontsize=12)
-    plt.title('RMI Error Window Reduction vs. Model Count (M)', fontsize=14)
-    plt.grid(True, which="both", ls="--", alpha=0.5)
-    plt.legend()
-    
-    err_plot_path = "data/error_reduction.png"
-    plt.savefig(err_plot_path, dpi=300, bbox_inches='tight')
-    print(f"Error reduction plot saved to {err_plot_path}.")
-    
-    # 4. Generate Summary Report Table
-    report_path = "data/parameter_sweep_report.md"
-    print(f"Writing summary report to {report_path}...")
+    # 3. Generate Summary Report Table
+    report_path = os.path.join(base_run_dir, "parameter_sweep_report.md")
     with open(report_path, 'w') as f:
-        f.write("# RMI Parameter Sweep & Sensitivity Report\n\n")
-        f.write("This report displays performance and size metrics gathered during the parameter sweep over different distributions.\n\n")
-        
+        f.write(f"# RMI Sweep Report ({run_id})\n\n")
         for dist in distributions:
             f.write(f"## Distribution: {dist.upper()}\n\n")
-            
             bt = sweep_data[dist]["btree"]
             if bt:
-                f.write(f"* **B+Tree Baseline**: Size = {bt['memory_bytes']/1024/1024:.2f} MB, Latency = {bt['avg_latency_us']:.4f} us, Throughput = {bt['throughput_mqps']:.4f} MQPS\n\n")
-            
-            f.write("| Leaf Count (M) | Index Memory (KB) | Avg Latency (us) | Throughput (MQPS) | Max Error (epsilon) |\n")
+                f.write(f"* **B+Tree**: Size = {bt['memory_bytes']/1024/1024:.2f} MB, Latency = {bt['avg_latency_us']:.4f} us\n\n")
+            f.write("| Leaf Count (M) | Index Memory (KB) | Avg Latency (us) | Throughput (MQPS) | Max Error |\n")
             f.write("| --- | --- | --- | --- | --- |\n")
             for r in sweep_data[dist]["rmi"]:
                 f.write(f"| {r['M']} | {r['memory_bytes']/1024:.2f} KB | {r['avg_latency_us']:.4f} us | {r['throughput_mqps']:.4f} MQPS | {r['max_error']} |\n")
             f.write("\n")
 
-    print("\nSweep Complete! Check data/pareto_frontier.png and data/parameter_sweep_report.md.")
+    print(f"\nSweep Complete! Visualizations and tables generated inside {base_run_dir}/")
 
 if __name__ == "__main__":
     main()
