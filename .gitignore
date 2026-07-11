@@ -1,0 +1,61 @@
+# ==========================================
+#  Learned Index Pipeline: Gitignore Rules
+# ==========================================
+
+# 1. Compiled C++ Executables & Build Artifacts
+btree_benchmark
+rmi_benchmark
+buffered_rmi_benchmark
+btree_test
+
+# C++ Build Directories & Objects
+build/
+cmake-build-debug/
+cmake-build-release/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# 2. Generated data/ directory
+# Contains large binary datasets (80MB+), trained model params,
+# and per-run results stored in timestamped subdirectories.
+data/
+
+# 3. Python Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# 4. Python Cache, Precompiled, & Package Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+wheels/
+
+# 5. macOS & Windows System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+
+# 6. IDE, Editor, & OS Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd/
+.cache/
