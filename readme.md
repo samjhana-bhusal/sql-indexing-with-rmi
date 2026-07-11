@@ -9,22 +9,21 @@ This project demonstrates how database workloads can be shifted from memory-boun
 ## Performance Summary
 
 Evaluated on a 10-million row lognormal distribution dataset using Apple Silicon unified hardware (`run_20260711_105955`).
-
 ### 1. Index Size & Read Throughput
-* **B+Tree Baseline**: **334.71 MB** footprint | 4.74 MQPS (0.210 $\mu$s/query)
-* **Hybrid RMI ($M=5000$)**: **117.97 KB** footprint | **14.91 MQPS** (0.067 $\mu$s/query)
-* **Result**: RMI achieves a **99.96% memory reduction** and scales **3.14$\times$ faster** by fitting entirely within L2 cache lines.
+* **B+Tree Baseline**: **334.71 MB** footprint | 4.74 MQPS (0.210 μs/query)
+* **Hybrid RMI (M=5000)**: **117.97 KB** footprint | **14.91 MQPS** (0.067 μs/query)
+* **Result**: RMI achieves a **99.96% memory reduction** and scales **3.14× faster** by fitting entirely within L2 cache lines.
 
 ### 2. Dynamic LSM-Buffer Scaling
-Real-time inserts run at a consistent **0.0230 $\mu$s/write**. As un-indexed keys accumulate in the delta store, read latency adjusts across the tracking blocks:
+Real-time inserts run at a consistent **0.0230 μs/write**. As un-indexed keys accumulate in the delta store, read latency adjusts across the tracking blocks:
 
-| Buffer Size (Keys) | Avg Read Latency ($\mu$s) |
-|--------------------|--------------------------|
-| 0 (Base RMI)       | 0.0589                   |
-| 100                | 0.0646                   |
-| 1,000              | 0.0784                   |
-| 5,000              | 0.0991                   |
-| 10,000             | 0.1050                   |
+| Buffer Size (Keys) | Avg Read Latency (μs) |
+|--------------------|-----------------------|
+| 0 (Base RMI)       | 0.0589                |
+| 100                | 0.0646                |
+| 1,000              | 0.0784                |
+| 5,000              | 0.0991                |
+| 10,000             | 0.1050                |
 
 ### 3. GPU Parallel Batch Sweep (MPS)
 Throughput profiles evaluating 100,000 randomized lookups show the parallel hardware sweet spot at a batch size of 512:
@@ -38,9 +37,13 @@ Throughput profiles evaluating 100,000 randomized lookups show the parallel hard
 | 4096       | 0.0823             | 1.2145            |
 | 8192       | 0.0539             | 1.8562            |
 
----
----
+## Visualizations
 
+### Pareto Frontier (Memory vs. Latency)
+![Pareto Frontier](report/pareto_frontier.png)
+
+### GPU Hardware Throughput Scaling Curve
+![GPU Throughput Scaling](report/gpu_throughput.png)
 ## Quick Start
 
 ### Run the Pipeline
