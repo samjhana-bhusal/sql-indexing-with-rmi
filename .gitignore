@@ -7,6 +7,12 @@ btree_benchmark
 rmi_benchmark
 buffered_rmi_benchmark
 btree_test
+adaptive_rmi_benchmark
+alex_benchmark
+lipp_benchmark
+
+# External dependencies (cloned by setup — see README)
+external/
 
 # C++ Build Directories & Objects
 build/
