@@ -101,8 +101,9 @@ def main():
         pred_pos = slopes[leaf_idx] * warmup.float() + intercepts[leaf_idx]
         curr_low = torch.bucketize(warmup, keys)
         
-    batch_sizes = [1, 128, 512, 1024, 4096, 8192]
+    batch_sizes = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     results = {}
+    gpu_mem_usage = {}
     
     print("\nStarting batch benchmarks...")
     for bs in batch_sizes:
@@ -132,13 +133,24 @@ def main():
                 
         if device.type == 'cuda':
             torch.cuda.synchronize()
-            
+
         t_end = time.perf_counter()
         elapsed = t_end - t_start
         throughput_mqps = (args.queries / elapsed) / 1e6
-        
+
+        # Track GPU memory utilization
+        if device.type == 'mps':
+            mem_alloc = torch.mps.current_allocated_memory() / (1024 * 1024)  # MB
+        elif device.type == 'cuda':
+            mem_alloc = torch.cuda.memory_allocated() / (1024 * 1024)
+        else:
+            mem_alloc = 0.0
+
         results[bs] = throughput_mqps
-        print(f"  Batch Size {bs:4d} | Time: {elapsed:6.4f} s | Throughput: {throughput_mqps:7.4f} MQPS")
+        gpu_mem_usage[bs] = mem_alloc
+        n_iterations = (args.queries + bs - 1) // bs
+        compute_pct = min(100.0, (bs / 65536.0) * 100.0)  # rough utilization proxy
+        print(f"  Batch Size {bs:5d} | Time: {elapsed:6.4f} s | Throughput: {throughput_mqps:7.4f} MQPS | Iters: {n_iterations:5d} | GPU Mem: {mem_alloc:.1f} MB")
         
     res_path = os.path.join(args.out_dir, "gpu_results.txt")
     with open(res_path, 'w') as f:
@@ -147,14 +159,31 @@ def main():
             
     try:
         import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        plt.plot(list(results.keys()), list(results.values()), marker='o', linewidth=2, color='#1f77b4')
-        plt.xscale('log', base=2)
-        plt.xlabel('Batch Size (Log Scale)', fontsize=12)
-        plt.ylabel('Throughput (Million queries/sec)', fontsize=12)
-        plt.title('GPU RMI Lookup Throughput vs. Batch Size', fontsize=14)
-        plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.xticks(batch_sizes, [str(bs) for bs in batch_sizes])
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
+                                        gridspec_kw={'height_ratios': [2, 1]})
+
+        bs_list = list(results.keys())
+        tp_list = list(results.values())
+        mem_list = [gpu_mem_usage.get(bs, 0) for bs in bs_list]
+
+        ax1.plot(bs_list, tp_list, marker='o', linewidth=2, color='#1f77b4')
+        ax1.set_ylabel('Throughput (MQPS)', fontsize=12)
+        ax1.set_title('When GPU Batching Loses: The Parallel Dispatch Paradox', fontsize=13)
+        ax1.grid(True, which="both", ls="--", alpha=0.5)
+
+        # Mark CPU RMI throughput as a horizontal reference
+        ax1.axhline(y=14.91, color='#d62728', linestyle='--', linewidth=1.5, label='CPU RMI (14.91 MQPS)')
+        ax1.legend(fontsize=10)
+
+        ax2.bar(range(len(bs_list)), mem_list, color='#ff7f0e', alpha=0.7)
+        ax2.set_xticks(range(len(bs_list)))
+        ax2.set_xticklabels([str(bs) for bs in bs_list], rotation=45, fontsize=9)
+        ax2.set_xlabel('Batch Size', fontsize=12)
+        ax2.set_ylabel('GPU Mem (MB)', fontsize=12)
+        ax2.grid(True, axis='y', ls="--", alpha=0.5)
+
+        plt.tight_layout()
         plot_path = os.path.join(args.out_dir, "gpu_throughput.png")
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         print(f"\nPlot saved to {plot_path}.")

@@ -8,17 +8,14 @@
 #include <numeric>
 #include <cmath>
 #include <string>
-#include "btree.hpp"
+
+#include "lipp.h"
 
 bool load_binary_file(const std::string& path, std::vector<uint64_t>& vec) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        std::cerr << "Failed to open file: " << path << std::endl;
-        return false;
-    }
+    if (!in) return false;
     uint64_t N = 0;
     in.read(reinterpret_cast<char*>(&N), sizeof(uint64_t));
-    if (!in) return false;
     vec.resize(N);
     in.read(reinterpret_cast<char*>(vec.data()), N * sizeof(uint64_t));
     return in.good();
@@ -47,14 +44,14 @@ int main(int argc, char* argv[]) {
     }
 
     std::string keys_path = run_dir + "/keys.bin";
-    std::string pos_path = run_dir + "/positions.bin";
+    std::string pos_path  = run_dir + "/positions.bin";
 
     std::vector<uint64_t> keys;
     std::vector<uint64_t> positions;
 
-    std::cout << "Loading dataset binaries from " << run_dir << "..." << std::endl;
+    std::cout << "Loading dataset from " << run_dir << "..." << std::endl;
     if (!load_binary_file(keys_path, keys) || !load_binary_file(pos_path, positions)) {
-        std::cerr << "Error: Could not load data files from: " << run_dir << std::endl;
+        std::cerr << "Error: Could not load data files." << std::endl;
         return 1;
     }
 
@@ -62,25 +59,27 @@ int main(int argc, char* argv[]) {
     std::cout << "Loaded " << N << " elements." << std::endl;
     assert(N == positions.size());
 
-    std::cout << "Building B+Tree..." << std::endl;
+    // Bulk-load LIPP
+    std::cout << "Building LIPP index (bulk load)..." << std::endl;
+    LIPP<uint64_t, uint64_t> index;
+
+    std::vector<std::pair<uint64_t, uint64_t>> kv_pairs(N);
+    for (size_t i = 0; i < N; ++i) {
+        kv_pairs[i] = {keys[i], positions[i]};
+    }
+
     auto build_start = std::chrono::high_resolution_clock::now();
-    BPlusTree tree;
-    for (size_t i = 0; i < N; ++i) tree.insert(keys[i], positions[i]);
+    index.bulk_load(kv_pairs.data(), static_cast<int>(N));
     auto build_end = std::chrono::high_resolution_clock::now();
     double build_time = std::chrono::duration<double>(build_end - build_start).count();
-    std::cout << "B+Tree built in " << build_time << " seconds." << std::endl;
-
-    size_t mem_bytes = tree.get_memory_size();
-    std::cout << "Memory footprint: " << mem_bytes << " bytes ("
-              << static_cast<double>(mem_bytes) / (1024.0 * 1024.0) << " MB)" << std::endl;
+    std::cout << "LIPP built in " << build_time << " seconds." << std::endl;
 
     size_t num_queries = 100000;
-
     std::cout << "Running " << num_trials << " trials of " << num_queries
               << " random lookups..." << std::endl;
 
     std::vector<double> throughputs;
-    std::vector<double> latencies;
+    std::vector<double> latencies_vec;
 
     for (int trial = 0; trial < num_trials; ++trial) {
         flush_caches();
@@ -94,10 +93,9 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; i < num_queries; ++i) {
             size_t idx = query_indices[i];
             uint64_t target_key = keys[idx];
-            uint64_t target_val = 0;
-            bool found = tree.lookup(target_key, target_val);
-            assert(found && "Key must be found");
-            assert(target_val == positions[idx]);
+            assert(index.exists(target_key));
+            uint64_t val = index.at(target_key);
+            assert(val == positions[idx]);
         }
         auto end = std::chrono::high_resolution_clock::now();
 
@@ -106,7 +104,7 @@ int main(int argc, char* argv[]) {
         double mqps = (static_cast<double>(num_queries) / elapsed) / 1e6;
 
         throughputs.push_back(mqps);
-        latencies.push_back(avg_lat);
+        latencies_vec.push_back(avg_lat);
         std::cout << "  Trial " << (trial + 1) << ": " << mqps << " MQPS, "
                   << avg_lat << " us/query" << std::endl;
     }
@@ -116,26 +114,21 @@ int main(int argc, char* argv[]) {
     };
     auto stddev = [&mean](const std::vector<double>& v) {
         double m = mean(v);
-        double sq_sum = 0.0;
-        for (auto x : v) sq_sum += (x - m) * (x - m);
-        return std::sqrt(sq_sum / v.size());
+        double sq = 0.0;
+        for (auto x : v) sq += (x - m) * (x - m);
+        return std::sqrt(sq / v.size());
     };
 
     double mean_mqps = mean(throughputs);
     double std_mqps  = stddev(throughputs);
-    double mean_lat  = mean(latencies);
-    double std_lat   = stddev(latencies);
-    double min_mqps  = *std::min_element(throughputs.begin(), throughputs.end());
-    double max_mqps  = *std::max_element(throughputs.begin(), throughputs.end());
+    double mean_lat  = mean(latencies_vec);
 
     std::cout << "\nResults (" << num_trials << " trials):" << std::endl;
-    std::cout << "  Throughput: " << mean_mqps << " +/- " << std_mqps << " MQPS"
-              << " [min=" << min_mqps << ", max=" << max_mqps << "]" << std::endl;
-    std::cout << "  Latency:    " << mean_lat << " +/- " << std_lat << " us/query" << std::endl;
+    std::cout << "  Throughput: " << mean_mqps << " +/- " << std_mqps << " MQPS" << std::endl;
+    std::cout << "  Latency:    " << mean_lat << " us/query" << std::endl;
 
-    std::ofstream out(run_dir + "/btree_results.txt");
+    std::ofstream out(run_dir + "/lipp_results.txt");
     if (out) {
-        out << "memory_bytes: " << mem_bytes << "\n";
         out << "avg_latency_us: " << mean_lat << "\n";
         out << "throughput_mqps: " << mean_mqps << "\n";
         out << "stddev_mqps: " << std_mqps << "\n";
