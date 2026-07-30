@@ -33,15 +33,27 @@ def generate_synthetic_data(num_elements=10000000, distribution="lognormal"):
         num_clusters = 5
         keys_per_cluster = num_elements // num_clusters
         keys_list = []
-        
+
         # Generate clusters centered at different intervals
         centroids = [1e12, 1.8e12, 3.2e12, 4.0e12, 4.8e12]
         for c in centroids:
             samples = np.random.normal(loc=c, scale=1e9, size=keys_per_cluster)
             keys_list.append(samples.astype(np.uint64))
-            
+
         keys = np.concatenate(keys_list)
-        
+
+    elif distribution == "drifting":
+        # Covariate shift: initial 50% from lognormal(mu=0, sigma=1),
+        # remaining 50% from lognormal(mu=2, sigma=1).
+        # Matches the drift taxonomy used in proj2 (Drift-Lab).
+        half = num_elements // 2
+        phase1 = np.random.lognormal(mean=0.0, sigma=1.0, size=half)
+        phase2 = np.random.lognormal(mean=2.0, sigma=1.0, size=num_elements - half)
+        steps = np.concatenate([phase1, phase2])
+        keys = np.cumsum(steps).astype(np.uint64)
+        base_offset = np.uint64(1000000000000)
+        keys += base_offset
+
     else:
         raise ValueError(f"Unknown distribution: {distribution}")
         
@@ -93,7 +105,10 @@ def load_sosd_binary(bin_path):
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Data Acquisition & Preprocessing")
     parser.add_argument("--download", action="store_true", help="Try to download real SOSD wiki_ts dataset")
-    parser.add_argument("--distribution", type=str, default="lognormal", choices=["uniform", "normal", "lognormal", "clustered"], help="Distribution type for synthetic data")
+    parser.add_argument("--sosd-dataset", type=str, default=None,
+                        choices=["books", "fb", "osm_cellids", "wiki_ts"],
+                        help="Download and use a standard SOSD dataset")
+    parser.add_argument("--distribution", type=str, default="lognormal", choices=["uniform", "normal", "lognormal", "clustered", "drifting"], help="Distribution type for synthetic data")
     parser.add_argument("--num-keys", type=int, default=10000000, help="Number of keys to generate if synthetic")
     parser.add_argument("--out-dir", type=str, default="data", help="Output directory")
     parser.add_argument("--run-id", type=str, default="", help="Run ID to store data separately")
@@ -103,12 +118,32 @@ def main():
     out_dir = os.path.join(args.out_dir, args.run_id) if args.run_id else args.out_dir
     os.makedirs(out_dir, exist_ok=True)
     
+    SOSD_URLS = {
+        "books":       "https://zenodo.org/records/7841164/files/books_200M_uint64.gz",
+        "fb":          "https://zenodo.org/records/7841164/files/fb_200M_uint64.gz",
+        "osm_cellids": "https://zenodo.org/records/7841164/files/osm_cellids_200M_uint64.gz",
+        "wiki_ts":     "https://zenodo.org/records/7841164/files/wiki_ts_200M_uint64.gz",
+    }
+
     keys = None
-    if args.download:
+    if args.sosd_dataset:
+        url = SOSD_URLS[args.sosd_dataset]
+        name = f"{args.sosd_dataset}_200M_uint64"
+        gz_path = os.path.join(args.out_dir, name + ".gz")
+        bin_path = os.path.join(args.out_dir, name)
+        if not os.path.exists(bin_path):
+            print(f"Downloading SOSD {args.sosd_dataset} from {url} ...")
+            os.makedirs(args.out_dir, exist_ok=True)
+            urllib.request.urlretrieve(url, gz_path)
+            with gzip.open(gz_path, "rb") as f_in, open(bin_path, "wb") as f_out:
+                f_out.write(f_in.read())
+            os.remove(gz_path)
+        keys = load_sosd_binary(bin_path)
+    elif args.download:
         bin_path = download_sosd_dataset(args.out_dir)
         if bin_path and os.path.exists(bin_path):
             keys = load_sosd_binary(bin_path)
-            
+
     if keys is None:
         keys = generate_synthetic_data(args.num_keys, args.distribution)
         
