@@ -46,10 +46,19 @@ echo -e "\n--> Running CPU B+Tree Benchmark..."
 ./btree_benchmark "$RUN_DIR"
 
 echo -e "\n--> Running CPU RMI Benchmark..."
-# ./rmi_benchmark "$RUN_DIR"
+./rmi_benchmark "$RUN_DIR"
 
 echo -e "\n--> Running Dynamic Read-Write (Delta-Buffered) RMI Benchmark..."
 ./buffered_rmi_benchmark "$RUN_DIR"
+
+echo -e "\n--> Running Adaptive RMI Benchmark (Drift-Triggered Retrain)..."
+./adaptive_rmi_benchmark "$RUN_DIR"
+
+echo -e "\n--> Running ALEX Baseline Benchmark..."
+./alex_benchmark "$RUN_DIR"
+
+echo -e "\n--> Running LIPP Baseline Benchmark..."
+./lipp_benchmark "$RUN_DIR"
 
 # 6. Phase 4: GPU Benchmarks
 echo -e "\n--> Phase 4: Running GPU Batch Benchmark..."
@@ -64,6 +73,33 @@ echo -e "\n=========================================================="
 echo "    Benchmark Complete!  Run: $RUN_ID                    "
 echo "=========================================================="
 
+# 8. SOSD Real-Data Benchmarks (books + wiki_ts)
+SOSD_DATASETS="books wiki_ts"
+for DATASET in $SOSD_DATASETS; do
+    SOSD_DIR="data/sosd_${DATASET}"
+    echo -e "\n--> SOSD: Preparing ${DATASET} dataset..."
+    python3 src/data_prep.py \
+        --sosd-dataset "$DATASET" \
+        --num-keys 10000000 \
+        --out-dir "$SOSD_DIR"
+
+    echo "--> SOSD: Training RMI on ${DATASET}..."
+    python3 src/train_rmi.py \
+        --keys "$SOSD_DIR/keys.bin" \
+        --positions "$SOSD_DIR/positions.bin" \
+        --num-leaves $OPTIMIZED_M \
+        --out-dir "$SOSD_DIR"
+
+    echo "--> SOSD: Running benchmarks on ${DATASET}..."
+    ./btree_benchmark "$SOSD_DIR"
+    ./rmi_benchmark "$SOSD_DIR"
+    ./alex_benchmark "$SOSD_DIR"
+    ./lipp_benchmark "$SOSD_DIR"
+
+    echo "  --> SOSD ${DATASET} done. Results in ${SOSD_DIR}/"
+done
+
+# 9. Summary Table Processing
 BT_FILE="$RUN_DIR/btree_results.txt"
 RMI_FILE="$RUN_DIR/rmi_results.txt"
 
@@ -71,17 +107,19 @@ if [ -f "$BT_FILE" ] && [ -f "$RMI_FILE" ]; then
     BT_MEM=$(grep  "memory_bytes"   "$BT_FILE"  | awk '{print $2}')
     BT_LAT=$(grep  "avg_latency_us" "$BT_FILE"  | awk '{print $2}')
     BT_THR=$(grep  "throughput_mqps" "$BT_FILE" | awk '{print $2}')
+    BT_STD=$(grep  "stddev_mqps"    "$BT_FILE"  | awk '{print $2}')
 
     RMI_MEM=$(grep  "memory_bytes"   "$RMI_FILE" | awk '{print $2}')
     RMI_LAT=$(grep  "avg_latency_us" "$RMI_FILE" | awk '{print $2}')
     RMI_THR=$(grep  "throughput_mqps" "$RMI_FILE" | awk '{print $2}')
+    RMI_STD=$(grep  "stddev_mqps"    "$RMI_FILE"  | awk '{print $2}')
 
     BT_MEM_MB=$(awk "BEGIN{printf \"%.2f\", $BT_MEM/1048576}")
     RMI_MEM_KB=$(awk "BEGIN{printf \"%.2f\", $RMI_MEM/1024}")
 
-    printf "\n%-28s %-20s %-20s\n" "Metric" "B+Tree (CPU)" "RMI (CPU)"
-    printf "%-28s %-20s %-20s\n" "--------" "----------" "---------"
-    printf "%-28s %-20s %-20s\n" "Index Memory" "${BT_MEM_MB} MB" "${RMI_MEM_KB} KB"
-    printf "%-28s %-20s %-20s\n" "Avg Latency" "${BT_LAT} us" "${RMI_LAT} us"
-    printf "%-28s %-20s %-20s\n" "Throughput" "${BT_THR} MQPS" "${RMI_THR} MQPS"
+    printf "\n%-28s %-24s %-24s\n" "Metric" "B+Tree (CPU)" "RMI (CPU)"
+    printf "%-28s %-24s %-24s\n" "--------" "----------" "---------"
+    printf "%-28s %-24s %-24s\n" "Index Memory" "${BT_MEM_MB} MB" "${RMI_MEM_KB} KB"
+    printf "%-28s %-24s %-24s\n" "Avg Latency" "${BT_LAT} us" "${RMI_LAT} us"
+    printf "%-28s %-24s %-24s\n" "Throughput" "${BT_THR} ± ${BT_STD} MQPS" "${RMI_THR} ± ${RMI_STD} MQPS"
 fi
