@@ -74,6 +74,10 @@ int main(int argc, char* argv[]) {
     double build_time = std::chrono::duration<double>(build_end - build_start).count();
     std::cout << "LIPP built in " << build_time << " seconds." << std::endl;
 
+    size_t lipp_mem = index.index_size();
+    std::cout << "LIPP Memory: " << lipp_mem << " bytes ("
+              << (lipp_mem / (1024.0 * 1024.0)) << " MB)" << std::endl;
+
     size_t num_queries = 100000;
     std::cout << "Running " << num_trials << " trials of " << num_queries
               << " random lookups..." << std::endl;
@@ -133,6 +137,7 @@ int main(int argc, char* argv[]) {
         out << "throughput_mqps: " << mean_mqps << "\n";
         out << "stddev_mqps: " << std_mqps << "\n";
         out << "trials: " << num_trials << "\n";
+        out << "memory_bytes: " << lipp_mem << "\n";
     }
 
     return 0;

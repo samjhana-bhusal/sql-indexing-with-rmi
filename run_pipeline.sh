@@ -123,3 +123,16 @@ if [ -f "$BT_FILE" ] && [ -f "$RMI_FILE" ]; then
     printf "%-28s %-24s %-24s\n" "Avg Latency" "${BT_LAT} us" "${RMI_LAT} us"
     printf "%-28s %-24s %-24s\n" "Throughput" "${BT_THR} ± ${BT_STD} MQPS" "${RMI_THR} ± ${RMI_STD} MQPS"
 fi
+
+# 10. Full Comparison Table (B+Tree vs RMI vs ALEX vs LIPP)
+echo -e "\n==> Full Comparison Table (synthetic + SOSD):"
+echo -e "\n--- Synthetic ($DISTRIBUTION) ---"
+python3 src/generate_comparison_table.py "$RUN_DIR"
+
+for DATASET in $SOSD_DATASETS; do
+    SOSD_DIR="data/sosd_${DATASET}"
+    if [ -d "$SOSD_DIR" ]; then
+        echo -e "\n--- SOSD: ${DATASET} ---"
+        python3 src/generate_comparison_table.py "$SOSD_DIR"
+    fi
+done
