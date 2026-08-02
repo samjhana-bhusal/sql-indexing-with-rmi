@@ -152,19 +152,40 @@ The LSM-style write path achieved an outstanding average insertion speed of \tex
 \end{tabular}
 \end{table}
 
-\subsection{When GPU Batching Loses: The Parallel Dispatch Paradox}
-We ported the multi-stage RMI lookup to Apple Silicon's MPS GPU framework and swept batch sizes from 1 to 65{,}536 over 100{,}000 queries, measuring throughput and GPU memory allocation at each point. This is an \textit{ablation} designed to answer: can naive batched dispatch amortize kernel-launch overhead against the tiny per-query compute of an RMI lookup?
+\subsection{The Cost of GPU Dispatch: Batch Size Sensitivity}
+We ported the multi-stage RMI lookup to Apple Silicon's MPS GPU framework and swept batch sizes from 1 to 65{,}536 over 100{,}000 queries, measuring throughput and GPU memory allocation at each point (5-run mean$\pm$stddev). This is an \textit{ablation} designed to answer: how large must a batch be before GPU dispatch amortizes against the tiny per-query compute of an RMI lookup?
+
+\medskip
+\noindent\textbf{Measurement note.} MPS and CUDA both dispatch asynchronously, and the timed region keeps every tensor on-device, so nothing forces an implicit synchronization. An earlier version of this experiment synchronized only on CUDA and therefore measured queue-submission time rather than execution time on MPS, understating the achievable GPU throughput by roughly $4\times$ at large batch sizes. All numbers below use an explicit \texttt{torch.mps.synchronize()} inside the timed region.
 
 \begin{figure}[h]
     \centering
     \includegraphics[width=\linewidth]{gpu_throughput.png}
-    \caption{GPU throughput (top) and memory allocation (bottom) across a log-scale sweep of batch sizes. The dashed line marks CPU RMI throughput (11.07 MQPS). GPU throughput saturates well below the CPU baseline at every batch size.}
+    \caption{GPU throughput (top) and memory allocation (bottom) across a log-scale sweep of batch sizes (5-run mean). The dashed line marks CPU RMI throughput (11.07 MQPS). GPU throughput rises monotonically to batch $8192$, where it reaches parity with the CPU, then declines.}
     \label{fig:gpu_throughput}
 \end{figure}
 
-The answer is no. At batch=1, per-dispatch overhead throttles throughput to 0.008~MQPS. As the batch size increases to 512, the GPU hardware begins to saturate its parallel lanes, peaking at \textbf{2.72~MQPS}---still \textbf{4.1$\times$ slower} than CPU RMI (11.07~MQPS). Extending the sweep to 65{,}536 confirms that throughput never approaches the CPU: beyond batch=512, the loop iteration count drops so low that host-device synchronization overhead dominates.
+\begin{table}[h]
+\centering
+\caption{GPU throughput vs.\ batch size (MPS, 5-run mean$\pm$stddev). CPU RMI baseline is $11.07 \pm 1.21$ MQPS.}
+\label{tab:gpu_sweep}
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Batch} & \textbf{MQPS} & \textbf{Batch} & \textbf{MQPS} \\
+\midrule
+1    & $0.008 \pm 0.000$ & 2048  & $8.28 \pm 2.87$ \\
+64   & $0.478 \pm 0.036$ & 4096  & $10.25 \pm 2.79$ \\
+128  & $0.963 \pm 0.027$ & \textbf{8192}  & $\mathbf{11.77 \pm 2.87}$ \\
+256  & $1.686 \pm 0.203$ & 16384 & $10.57 \pm 3.07$ \\
+512  & $3.308 \pm 0.490$ & 32768 & $8.48 \pm 2.19$ \\
+1024 & $5.380 \pm 1.234$ & 65536 & $6.01 \pm 1.87$ \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-The bottleneck is dispatch, not compute: each RMI lookup is $\sim$100 FLOPs (32-neuron hidden layer $+$ one linear spline), far too little to amortize kernel launch latency ($\sim$10--50~$\mu$s on MPS). GPU acceleration would require fusing thousands of independent lookups into a single kernel and pipelining CPU$\to$GPU transfers with double-buffering---an engineering investment whose payoff depends on workload concurrency levels that database index lookups rarely exhibit. This is a real, publishable negative result: naive GPU batching \textit{cannot} beat CPU for per-query learned index inference at this compute scale.
+The answer is: very large. At batch=1, per-dispatch overhead throttles throughput to $0.008$~MQPS---roughly $1400\times$ slower than the CPU, since every lookup pays a full kernel launch to do $\sim$100 FLOPs of work. Throughput then rises monotonically with batch size, peaking at \textbf{$11.77 \pm 2.87$~MQPS at batch=8192}. At that point the GPU is \textit{statistically indistinguishable} from the CPU RMI ($11.07 \pm 1.21$~MQPS; the intervals overlap substantially). Beyond 8192 throughput declines again: the loop iteration count falls into single digits, so per-dispatch overhead is amortized over fewer and fewer launches and measurement variance grows.
+
+The practical conclusion is not that the GPU is incapable, but that the \textit{break-even batch size is prohibitive}. Reaching mere parity with one CPU core requires accumulating $8{,}192$ independent lookups per dispatch---a level of query concurrency that point-lookup workloads in a storage engine rarely exhibit, and which would impose latency cost on every query while the batch fills. Each RMI lookup is $\sim$100 FLOPs (32-neuron hidden layer $+$ one linear spline), far too little to amortize kernel launch latency individually. Extracting a genuine \textit{speedup} rather than parity would require fusing the multi-stage lookup into a single kernel and pipelining CPU$\to$GPU transfers with double-buffering. The honest result is therefore a cost-benefit one: naive GPU batching buys no throughput over a single CPU core until batch sizes become impractically large.
 
 \section{Adaptive Retraining for Learned Indexes}
 

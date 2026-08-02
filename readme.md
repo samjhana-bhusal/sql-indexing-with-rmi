@@ -55,8 +55,23 @@ Real-time inserts run at a consistent **0.0230 μs/write**. As un-indexed keys a
 | 5,000              | 0.0991                |
 | 10,000             | 0.1050                |
 
-### 3. When GPU Batching Loses (The Parallel Dispatch Paradox)
-Sweeping batch sizes from 1 to 65,536 over 100K lookups reveals that GPU throughput peaks at 2.72 MQPS (batch=512) — **4.1× slower than CPU RMI** (11.07 MQPS). The per-query compute of an RMI lookup (~100 FLOPs) is too small to amortize kernel-launch overhead. This is an honest negative result, not a failure — it proves that learned indexes need workload-level concurrency (not query-level batching) to benefit from GPU acceleration.
+### 3. The Cost of GPU Dispatch (Batch Size Sensitivity)
+Sweeping batch sizes from 1 to 65,536 over 100K lookups (5-trial mean ± stddev, MPS):
+
+| Batch | MQPS | Batch | MQPS |
+|-------|------|-------|------|
+| 1 | 0.008 ± 0.000 | 2048 | 8.28 ± 2.87 |
+| 64 | 0.478 ± 0.036 | 4096 | 10.25 ± 2.79 |
+| 128 | 0.963 ± 0.027 | **8192** | **11.77 ± 2.87** |
+| 256 | 1.686 ± 0.203 | 16384 | 10.57 ± 3.07 |
+| 512 | 3.308 ± 0.490 | 32768 | 8.48 ± 2.19 |
+| 1024 | 5.380 ± 1.234 | 65536 | 6.01 ± 1.87 |
+
+At batch=1 the GPU is ~1400× slower than CPU — every lookup pays a full kernel launch for ~100 FLOPs of work. Throughput climbs monotonically to **11.77 ± 2.87 MQPS at batch=8192**, which is *statistically tied* with CPU RMI (11.07 ± 1.21), then falls off.
+
+The real finding is the **break-even batch size**: you need 8,192 concurrent lookups per dispatch just to *match* one CPU core — a concurrency level point-lookup workloads rarely reach, and which costs latency while the batch fills.
+
+> ⚠️ **This result was previously reported incorrectly.** The earlier version synchronized only on CUDA (`if device.type == 'cuda': torch.cuda.synchronize()`), so on MPS the timer measured *queue-submission* time, not execution time — understating GPU throughput ~4× at large batches and producing a bogus "GPU always loses by 4.1×" conclusion. Fixed with an explicit `torch.mps.synchronize()` inside the timed region.
 
 ### 4. Adaptive Retraining (Drift-Triggered)
 
@@ -130,7 +145,7 @@ proj1/
 │   ├── lipp_benchmark.cpp           # LIPP baseline
 │   ├── train_rmi.py                 # PyTorch Stage 1 NN + OLS Stage 2
 │   ├── data_prep.py                 # Synthetic + SOSD data generation
-│   ├── gpu_rmi_benchmark.py         # GPU dispatch paradox sweep
+│   ├── gpu_rmi_benchmark.py         # GPU batch-size sensitivity sweep
 │   ├── adaptive_evaluation.py       # 3-config A/B/C eval driver
 │   └── parameter_sweep.py           # M-sweep analysis
 └── external/

@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--params", type=str, default="data/rmi_params.bin")
     parser.add_argument("--queries", type=int, default=100000)
     parser.add_argument("--out-dir", type=str, default="data")
+    parser.add_argument("--trials", type=int, default=5,
+                        help="Repetitions per batch size; reported as mean +/- stddev")
     args = parser.parse_args()
     
     N, keys_np = load_binary_file(args.keys)
@@ -92,6 +94,19 @@ def main():
     # Pre-allocate all query keys directly on the GPU to fix the batch 1 latency bottleneck
     all_query_keys = torch.tensor(query_keys_np, dtype=torch.int64, device=device)
     
+    def device_sync():
+        """Block until all queued GPU work has actually executed.
+
+        Both CUDA and MPS dispatch asynchronously. The timed region below keeps
+        every tensor on-device (no .cpu()/.item()/host branch), so nothing forces
+        an implicit sync -- without this, perf_counter measures queue-submission
+        time rather than execution time and reports throughput far above reality.
+        """
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        elif device.type == 'mps':
+            torch.mps.synchronize()
+
     print("Running GPU warm-up...")
     with torch.no_grad():
         warmup = all_query_keys[:1000]
@@ -100,43 +115,51 @@ def main():
         leaf_idx = torch.clamp(torch.floor(y_pred * M).long(), 0, M - 1)
         pred_pos = slopes[leaf_idx] * warmup.float() + intercepts[leaf_idx]
         curr_low = torch.bucketize(warmup, keys)
-        
+    device_sync()  # drain warm-up before any timing starts
+
     batch_sizes = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     results = {}
     gpu_mem_usage = {}
     
-    print("\nStarting batch benchmarks...")
+    print(f"\nStarting batch benchmarks ({args.trials} trials each)...")
+    results_std = {}
     for bs in batch_sizes:
-        t_start = time.perf_counter()
-        
-        for i in range(0, args.queries, bs):
-            batch_end = min(i + bs, args.queries)
-            # Slice directly on GPU memory to maintain maximum speed
-            batch_keys = all_query_keys[i:batch_end]
-            
-            with torch.no_grad():
-                # 1. Scale keys
-                x_scaled = (batch_keys.float() - min_key) / (max_key - min_key)
-                
-                # 2. Stage 1 NN Inference
-                y_pred = model(x_scaled.float().unsqueeze(1)).squeeze(1)
-                
-                # 3. Leaf Index Selection
-                leaf_idx = torch.clamp(torch.floor(y_pred * M).long(), 0, M - 1)
-                
-                # 4. Stage 2 Linear Function
-                pred_pos = slopes[leaf_idx] * batch_keys.float() + intercepts[leaf_idx]
-                
-                # 5. Parallel Binary Search via highly optimized native bucketize
-                curr_low = torch.bucketize(batch_keys, keys)
-                curr_low = torch.clamp(curr_low, 0, N - 1)
-                
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
+        trial_mqps = []
+        for _ in range(args.trials):
+            device_sync()  # ensure nothing from a previous trial is still in flight
+            t_start = time.perf_counter()
 
-        t_end = time.perf_counter()
-        elapsed = t_end - t_start
-        throughput_mqps = (args.queries / elapsed) / 1e6
+            for i in range(0, args.queries, bs):
+                batch_end = min(i + bs, args.queries)
+                # Slice directly on GPU memory to maintain maximum speed
+                batch_keys = all_query_keys[i:batch_end]
+
+                with torch.no_grad():
+                    # 1. Scale keys
+                    x_scaled = (batch_keys.float() - min_key) / (max_key - min_key)
+
+                    # 2. Stage 1 NN Inference
+                    y_pred = model(x_scaled.float().unsqueeze(1)).squeeze(1)
+
+                    # 3. Leaf Index Selection
+                    leaf_idx = torch.clamp(torch.floor(y_pred * M).long(), 0, M - 1)
+
+                    # 4. Stage 2 Linear Function
+                    pred_pos = slopes[leaf_idx] * batch_keys.float() + intercepts[leaf_idx]
+
+                    # 5. Parallel Binary Search via highly optimized native bucketize
+                    curr_low = torch.bucketize(batch_keys, keys)
+                    curr_low = torch.clamp(curr_low, 0, N - 1)
+
+            device_sync()
+
+            t_end = time.perf_counter()
+            trial_mqps.append((args.queries / (t_end - t_start)) / 1e6)
+
+        throughput_mqps = float(np.mean(trial_mqps))
+        std_mqps = float(np.std(trial_mqps))
+        elapsed = args.queries / (throughput_mqps * 1e6)
+        results_std[bs] = std_mqps
 
         # Track GPU memory utilization
         if device.type == 'mps':
@@ -150,7 +173,7 @@ def main():
         gpu_mem_usage[bs] = mem_alloc
         n_iterations = (args.queries + bs - 1) // bs
         compute_pct = min(100.0, (bs / 65536.0) * 100.0)  # rough utilization proxy
-        print(f"  Batch Size {bs:5d} | Time: {elapsed:6.4f} s | Throughput: {throughput_mqps:7.4f} MQPS | Iters: {n_iterations:5d} | GPU Mem: {mem_alloc:.1f} MB")
+        print(f"  Batch Size {bs:5d} | Throughput: {throughput_mqps:7.4f} +/- {results_std[bs]:6.4f} MQPS | Iters: {n_iterations:5d} | GPU Mem: {mem_alloc:.1f} MB")
         
     res_path = os.path.join(args.out_dir, "gpu_results.txt")
     with open(res_path, 'w') as f:
@@ -169,7 +192,7 @@ def main():
 
         ax1.plot(bs_list, tp_list, marker='o', linewidth=2, color='#1f77b4')
         ax1.set_ylabel('Throughput (MQPS)', fontsize=12)
-        ax1.set_title('When GPU Batching Loses: The Parallel Dispatch Paradox', fontsize=13)
+        ax1.set_title('GPU Dispatch Cost: Break-Even Batch Size vs. CPU RMI', fontsize=13)
         ax1.grid(True, which="both", ls="--", alpha=0.5)
 
         # Mark CPU RMI throughput as a horizontal reference
