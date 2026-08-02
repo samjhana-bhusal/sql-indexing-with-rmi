@@ -130,12 +130,19 @@ def main():
         
     model.eval()
     print("Evaluating Stage 1 model to assign leaf buckets...")
+    # Assign buckets in float64. The C++ runtime (rmi_benchmark.cpp) evaluates
+    # Stage 1 in double precision against float64-exported weights, so doing this
+    # pass in float32 makes Python and C++ disagree on the leaf index for keys
+    # whose y*M lands near a bucket boundary. Those keys then get looked up
+    # against a leaf whose error bound does not cover them, and the bounded
+    # last-mile search misses. Observed at 0.015% of keys on SOSD books.
+    model_fp64 = model.double()
     predictions = []
     with torch.no_grad():
         for i in range(0, N, 1000000):
             batch_keys = scaled_keys[i:i+1000000]
-            batch_tensor = torch.tensor(batch_keys, dtype=torch.float32).unsqueeze(1).to(device)
-            batch_pred = model(batch_tensor).cpu().numpy().flatten()
+            batch_tensor = torch.tensor(batch_keys, dtype=torch.float64).unsqueeze(1).to(device)
+            batch_pred = model_fp64(batch_tensor).cpu().numpy().flatten()
             predictions.append(batch_pred)
             
     y_pred = np.concatenate(predictions)

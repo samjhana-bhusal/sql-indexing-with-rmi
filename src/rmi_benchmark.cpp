@@ -147,6 +147,8 @@ int main(int argc, char* argv[]) {
     std::vector<double> throughputs;
     std::vector<double> latencies;
 
+    size_t fallback_count = 0;
+
     for (int trial = 0; trial < num_trials; ++trial) {
         flush_caches();
 
@@ -174,7 +176,16 @@ int main(int argc, char* argv[]) {
             if (low < 0) low = 0;
             if (high >= (int64_t)N) high = N - 1;
 
-            auto it = std::lower_bound(keys.begin() + low, keys.begin() + high + 1, target_key);
+            auto hi_it = keys.begin() + high + 1;
+            auto it = std::lower_bound(keys.begin() + low, hi_it, target_key);
+            // Last-mile fallback: if Stage 1 assigned a leaf whose error bound
+            // does not cover this key, the bounded window misses. Widen to a
+            // full search rather than returning a wrong answer. Rare, but must
+            // be counted and reported, not swallowed.
+            if (it == hi_it || *it != target_key) {
+                it = std::lower_bound(keys.begin(), keys.end(), target_key);
+                ++fallback_count;
+            }
             assert(it != keys.end() && *it == target_key);
             uint64_t found_pos = std::distance(keys.begin(), it);
             assert(found_pos == positions[idx]);
@@ -213,12 +224,19 @@ int main(int argc, char* argv[]) {
               << " [min=" << min_mqps << ", max=" << max_mqps << "]" << std::endl;
     std::cout << "  Latency:    " << mean_lat << " +/- " << std_lat << " us/query" << std::endl;
 
+    size_t total_queries = num_queries * (size_t)num_trials;
+    double fallback_rate = 100.0 * (double)fallback_count / (double)total_queries;
+    std::cout << "  Bound misses: " << fallback_count << " / " << total_queries
+              << " (" << fallback_rate << "%)" << std::endl;
+
     std::ofstream out(params_dir + "/rmi_results.txt");
     if (out) {
         out << "memory_bytes: " << rmi_mem_bytes << "\n";
         out << "avg_latency_us: " << mean_lat << "\n";
         out << "throughput_mqps: " << mean_mqps << "\n";
         out << "stddev_mqps: " << std_mqps << "\n";
+        out << "bound_misses: " << fallback_count << "\n";
+        out << "bound_miss_rate_pct: " << fallback_rate << "\n";
         out << "trials: " << num_trials << "\n";
     }
 

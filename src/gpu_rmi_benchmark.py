@@ -173,7 +173,7 @@ def main():
         ax1.grid(True, which="both", ls="--", alpha=0.5)
 
         # Mark CPU RMI throughput as a horizontal reference
-        ax1.axhline(y=14.91, color='#d62728', linestyle='--', linewidth=1.5, label='CPU RMI (14.91 MQPS)')
+        ax1.axhline(y=11.07, color='#d62728', linestyle='--', linewidth=1.5, label='CPU RMI (11.07 MQPS)')
         ax1.legend(fontsize=10)
 
         ax2.bar(range(len(bs_list)), mem_list, color='#ff7f0e', alpha=0.7)

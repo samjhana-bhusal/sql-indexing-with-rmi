@@ -11,11 +11,38 @@ This project demonstrates how database workloads can be shifted from memory-boun
 Evaluated on a 10-million row lognormal distribution dataset using Apple Silicon unified hardware. All throughput numbers are **5-trial mean ± stddev** with inter-trial cache flushing.
 
 ### 1. Index Size & Read Throughput
-* **B+Tree Baseline**: **334.71 MB** footprint | 4.74 MQPS (0.210 μs/query)
-* **Hybrid RMI (M=5000)**: **117.97 KB** footprint | **14.91 MQPS** (0.067 μs/query)
-* **ALEX** (Ding et al. 2020): updatable learned index baseline
-* **LIPP** (Wu et al. 2021): SOTA updatable learned index baseline
-* **Result**: RMI achieves a **99.96% memory reduction** and scales **3.14× faster** by fitting entirely within L2 cache lines.
+
+Synthetic lognormal, N=10M:
+
+| Index | Memory | Throughput (MQPS) | Latency (μs) |
+|-------|--------|-------------------|--------------|
+| B+Tree (B=64) | 334.72 MB | 4.00 ± 0.72 | 0.259 |
+| **RMI (M=5000)** | **117.98 KB** | 11.07 ± 1.21 | 0.091 |
+| ALEX (Ding et al. 2020) | 218.31 MB | 14.98 ± 4.51 | 0.080 |
+| LIPP (Wu et al. 2021) | 710.07 MB | **22.74 ± 5.80** | **0.049** |
+
+**Result**: LIPP and ALEX win on raw throughput, but the RMI is **three orders of magnitude smaller** (118 KB vs 218–710 MB) — small enough to sit entirely in L2 cache. That is the RMI's actual selling point, not peak MQPS.
+
+### 1b. Real-World Validation (SOSD)
+
+Same pipeline on real key distributions — [SOSD](https://zenodo.org/records/15240501) `books` (11.42M unique keys) and `wiki_ts` (3.37M unique keys):
+
+| Dataset | Index | Memory | MQPS | Latency (μs) |
+|---------|-------|--------|------|--------------|
+| books | B+Tree | 384.66 MB | 4.00 ± 0.65 | 0.259 |
+| books | **RMI** | **117.98 KB** | 10.42 ± 1.23 | 0.097 |
+| books | ALEX | 250.88 MB | **11.08 ± 1.78** | **0.093** |
+| books | LIPP | — | n/a¹ | — |
+| wiki_ts | B+Tree | 113.35 MB | 5.49 ± 0.39 | 0.183 |
+| wiki_ts | **RMI** | **117.98 KB** | 14.08 ± 0.59 | 0.071 |
+| wiki_ts | ALEX | 78.07 MB | 15.32 ± 0.84 | 0.065 |
+| wiki_ts | LIPP | 331.79 MB | **18.46 ± 1.89** | **0.055** |
+
+The synthetic findings hold on real data: the RMI stays within 6–9% of ALEX's throughput at a tiny fraction of the memory.
+
+> ¹ **LIPP cannot bulk-load `books` on Apple Silicon.** LIPP computes node models in `long double`, which is 64-bit on AArch64 (53-bit mantissa) but 80-bit on x86-64. 83.1% of `books` keys exceed 2^53, and one adjacent key pair — distinct as `uint64` — collides when cast, producing a divide-by-zero and a non-finite slope. This is an upstream portability limitation, not an algorithmic result, so it is reported as unavailable rather than worked around. LIPP is unaffected on `wiki_ts` (keys are O(10⁹)).
+
+> **Precision fix found via real data.** Stage 1 bucket assignment was originally done in `float32` at training time while the C++ runtime evaluates the exported weights in `float64`. On `books` this put 0.015% of keys (1,742 of 11.42M) in a different leaf than the one whose error bound was fitted for them, so bounded search missed. Fixed by doing bucket assignment in `float64`, plus a last-mile fallback that widens to a full search on a bound miss — so a boundary disagreement costs throughput, never correctness. Post-fix bound-miss rate: **0 / 500,000** on both datasets.
 
 ### 2. Dynamic LSM-Buffer Scaling
 Real-time inserts run at a consistent **0.0230 μs/write**. As un-indexed keys accumulate in the delta store, read latency adjusts:
@@ -29,7 +56,7 @@ Real-time inserts run at a consistent **0.0230 μs/write**. As un-indexed keys a
 | 10,000             | 0.1050                |
 
 ### 3. When GPU Batching Loses (The Parallel Dispatch Paradox)
-Sweeping batch sizes from 1 to 65,536 over 100K lookups reveals that GPU throughput peaks at 2.72 MQPS (batch=512) — **5.5× slower than CPU RMI** (14.91 MQPS). The per-query compute of an RMI lookup (~100 FLOPs) is too small to amortize kernel-launch overhead. This is an honest negative result, not a failure — it proves that learned indexes need workload-level concurrency (not query-level batching) to benefit from GPU acceleration.
+Sweeping batch sizes from 1 to 65,536 over 100K lookups reveals that GPU throughput peaks at 2.72 MQPS (batch=512) — **4.1× slower than CPU RMI** (11.07 MQPS). The per-query compute of an RMI lookup (~100 FLOPs) is too small to amortize kernel-launch overhead. This is an honest negative result, not a failure — it proves that learned indexes need workload-level concurrency (not query-level batching) to benefit from GPU acceleration.
 
 ### 4. Adaptive Retraining (Drift-Triggered)
 

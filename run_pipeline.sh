@@ -91,10 +91,13 @@ for DATASET in $SOSD_DATASETS; do
         --out-dir "$SOSD_DIR"
 
     echo "--> SOSD: Running benchmarks on ${DATASET}..."
-    ./btree_benchmark "$SOSD_DIR"
-    ./rmi_benchmark "$SOSD_DIR"
-    ./alex_benchmark "$SOSD_DIR"
-    ./lipp_benchmark "$SOSD_DIR"
+    # Do not abort the whole pipeline if one index cannot handle a dataset.
+    # Known: LIPP fails to bulk-load `books` on AArch64 because its long double
+    # is 64-bit and 83% of books keys exceed 2^53 (see report Section 6).
+    ./btree_benchmark "$SOSD_DIR" || echo "  [WARN] btree_benchmark failed on ${DATASET}"
+    ./rmi_benchmark   "$SOSD_DIR" || echo "  [WARN] rmi_benchmark failed on ${DATASET}"
+    ./alex_benchmark  "$SOSD_DIR" || echo "  [WARN] alex_benchmark failed on ${DATASET}"
+    ./lipp_benchmark  "$SOSD_DIR" || echo "  [WARN] lipp_benchmark failed on ${DATASET}"
 
     echo "  --> SOSD ${DATASET} done. Results in ${SOSD_DIR}/"
 done

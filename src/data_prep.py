@@ -119,25 +119,28 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     
     SOSD_URLS = {
-        "books":       "https://zenodo.org/records/7841164/files/books_200M_uint64.gz",
-        "fb":          "https://zenodo.org/records/7841164/files/fb_200M_uint64.gz",
-        "osm_cellids": "https://zenodo.org/records/7841164/files/osm_cellids_200M_uint64.gz",
-        "wiki_ts":     "https://zenodo.org/records/7841164/files/wiki_ts_200M_uint64.gz",
+        "books":       "https://zenodo.org/api/records/15240501/files/books_50M_uint64/content",
+        "fb":          "https://zenodo.org/api/records/15240501/files/fb_200M_uint64/content",
+        "osm_cellids": "https://zenodo.org/api/records/15240501/files/osm_cellids_800M_uint64/content",
+        "wiki_ts":     "https://zenodo.org/api/records/15240501/files/wiki_ts_200M_uint64/content",
+    }
+
+    SOSD_FILE_NAMES = {
+        "books":       "books_50M_uint64",
+        "fb":          "fb_200M_uint64",
+        "osm_cellids": "osm_cellids_800M_uint64",
+        "wiki_ts":     "wiki_ts_200M_uint64",
     }
 
     keys = None
     if args.sosd_dataset:
         url = SOSD_URLS[args.sosd_dataset]
-        name = f"{args.sosd_dataset}_200M_uint64"
-        gz_path = os.path.join(args.out_dir, name + ".gz")
+        name = SOSD_FILE_NAMES[args.sosd_dataset]
         bin_path = os.path.join(args.out_dir, name)
         if not os.path.exists(bin_path):
             print(f"Downloading SOSD {args.sosd_dataset} from {url} ...")
             os.makedirs(args.out_dir, exist_ok=True)
-            urllib.request.urlretrieve(url, gz_path)
-            with gzip.open(gz_path, "rb") as f_in, open(bin_path, "wb") as f_out:
-                f_out.write(f_in.read())
-            os.remove(gz_path)
+            urllib.request.urlretrieve(url, bin_path)
         keys = load_sosd_binary(bin_path)
     elif args.download:
         bin_path = download_sosd_dataset(args.out_dir)

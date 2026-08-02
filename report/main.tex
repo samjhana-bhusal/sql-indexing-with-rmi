@@ -5,6 +5,7 @@
 \usepackage{amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{multirow}
 \usepackage{cite}
 \usepackage{microtype}
 \usepackage{url}
@@ -76,11 +77,12 @@ To support dynamic insertions, we integrate a dynamic write store (a Red-Black T
 
 \begin{table*}[t]
 \centering
-\caption{Comprehensive Performance Metrics: B+Tree vs. RMI across Parameter Space ($M$)}
+\caption{Comprehensive Performance Metrics: B+Tree vs. RMI across Parameter Space ($M$). \textit{Protocol note:} this sweep was collected under the earlier single-run protocol without inter-trial cache flushing, so its absolute throughputs run optimistically high relative to Tables~\ref{tab:baselines} and~\ref{tab:sosd} (e.g.\ lognormal $M{=}5000$ reports $14.91$ MQPS here vs.\ $11.07 \pm 1.21$ MQPS under the 5-trial cache-flushed protocol). The \textit{relative} ordering across $M$ and across distributions is unaffected, which is what this table is used to establish.}
 \label{tab:sweep_results}
+\setlength{\tabcolsep}{4.5pt}
 \begin{tabular}{llrrrr}
 \toprule
-\textbf{Distribution} & \textbf{Index Configuration} & \textbf{Memory Size} & \textbf{Avg Latency} & \textbf{Throughput} & \textbf{Max Search Error} \\
+\textbf{Distribution} & \textbf{Configuration} & \textbf{Memory} & \textbf{Avg Latency} & \textbf{Throughput} & \textbf{Max Search Error} \\
 \midrule
 \textbf{UNIFORM} & B+Tree Baseline & 336.84 MB & 0.2215 $\mu$s & 24.01 MQPS & -- \\
                  & RMI ($M=100$) & 3.13 KB & 0.0416 $\mu$s & 24.01 MQPS & 1.0 \\
@@ -156,11 +158,11 @@ We ported the multi-stage RMI lookup to Apple Silicon's MPS GPU framework and sw
 \begin{figure}[h]
     \centering
     \includegraphics[width=\linewidth]{gpu_throughput.png}
-    \caption{GPU throughput (top) and memory allocation (bottom) across a log-scale sweep of batch sizes. The dashed line marks CPU RMI throughput (14.91 MQPS). GPU throughput saturates well below the CPU baseline at every batch size.}
+    \caption{GPU throughput (top) and memory allocation (bottom) across a log-scale sweep of batch sizes. The dashed line marks CPU RMI throughput (11.07 MQPS). GPU throughput saturates well below the CPU baseline at every batch size.}
     \label{fig:gpu_throughput}
 \end{figure}
 
-The answer is no. At batch=1, per-dispatch overhead throttles throughput to 0.008~MQPS. As the batch size increases to 512, the GPU hardware begins to saturate its parallel lanes, peaking at \textbf{2.72~MQPS}---still \textbf{5.5$\times$ slower} than CPU RMI (14.91~MQPS). Extending the sweep to 65{,}536 confirms that throughput never approaches the CPU: beyond batch=512, the loop iteration count drops so low that host-device synchronization overhead dominates.
+The answer is no. At batch=1, per-dispatch overhead throttles throughput to 0.008~MQPS. As the batch size increases to 512, the GPU hardware begins to saturate its parallel lanes, peaking at \textbf{2.72~MQPS}---still \textbf{4.1$\times$ slower} than CPU RMI (11.07~MQPS). Extending the sweep to 65{,}536 confirms that throughput never approaches the CPU: beyond batch=512, the loop iteration count drops so low that host-device synchronization overhead dominates.
 
 The bottleneck is dispatch, not compute: each RMI lookup is $\sim$100 FLOPs (32-neuron hidden layer $+$ one linear spline), far too little to amortize kernel launch latency ($\sim$10--50~$\mu$s on MPS). GPU acceleration would require fusing thousands of independent lookups into a single kernel and pipelining CPU$\to$GPU transfers with double-buffering---an engineering investment whose payoff depends on workload concurrency levels that database index lookups rarely exhibit. This is a real, publishable negative result: naive GPU batching \textit{cannot} beat CPU for per-query learned index inference at this compute scale.
 
@@ -183,7 +185,7 @@ When a segment is flagged, its Stage~2 OLS model (slope, intercept, max-error) i
 
 We evaluate three configurations on a \textit{drifting} workload where the initial keys follow $\text{LogNormal}(\mu{=}0, \sigma{=}1)$ and 100{,}000 inserts shift to $\text{LogNormal}(\mu{=}2, \sigma{=}1)$---a genuine covariate shift.
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
 \caption{Adaptive retraining evaluation ($N{=}10^6$, $M{=}500$, 5-run mean$\pm$stddev).}
 \label{tab:adaptive}
@@ -196,7 +198,7 @@ B --- Periodic retrain & $4.00 \pm 0.15$ & $4501$ & $3.557 \pm 0.047$ \\
 C --- Adaptive retrain & $4.44 \pm 0.34$ & $583$  & $0.211 \pm 0.010$ \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 Figure~\ref{fig:adaptive} shows read throughput over time across the three configurations. Adaptive retraining (C) retrained only 13\% of the segments that periodic retraining (B) touched, at \textbf{5.9\% of the wall-clock cost}, while delivering 11\% higher read throughput. Configuration~A achieves the highest raw MQPS because it avoids retrain overhead entirely, but its prediction accuracy degrades silently as the distribution shifts---errors that would compound in a real workload with range queries or tail-latency SLAs.
 
@@ -218,7 +220,7 @@ To position our RMI against the state of the art in updatable learned indexes, w
 
 Both baselines are bulk-loaded with the same sorted key-value pairs and evaluated with the same 100{,}000-query random lookup workload (5-run mean$\pm$stddev, inter-trial cache flush). Table~\ref{tab:baselines} shows the results on the lognormal synthetic dataset ($N{=}10$M).
 
-\begin{table}[h]
+\begin{table*}[t]
 \centering
 \caption{Read-only lookup comparison on lognormal $N{=}10$M (5-run mean$\pm$stddev, inter-trial cache flush).}
 \label{tab:baselines}
@@ -232,13 +234,45 @@ ALEX~\cite{ding2020alex}   & 218.31 MB & $14.98 \pm 4.51$ & $0.080$ \\
 LIPP~\cite{wu2021lipp}     & 710.07 MB & $\mathbf{22.74 \pm 5.80}$ & $\mathbf{0.049}$ \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 \medskip
 
 The comparison highlights the trade-off each design makes. ALEX and LIPP are \textit{natively updatable}: they absorb inserts without an external buffer or retraining step, at the cost of higher per-node metadata overhead and more complex internal restructuring. ALEX maintains gapped arrays with per-node linear models that split and retrain dynamically on insert; LIPP uses intelligent node splitting to achieve fast point queries with low restructuring cost, though at $710$~MB it consumes the most memory of all tested indexes. Our RMI, by contrast, uses a decoupled delta buffer and drift-triggered localized retraining (Section~5). While LIPP and ALEX achieve higher raw throughput, the RMI's $118$~KB footprint is \textit{three orders of magnitude smaller} than any competitor---small enough to fit entirely in L2 cache---making it the preferred choice when memory is constrained or when the working set must coexist with other in-memory structures.
 
-On SOSD~\cite{marcus2020benchmarking} real-world datasets (books, wiki\_ts), we run the identical evaluation pipeline. These datasets stress the learned models with real-world key distributions that are neither uniform nor smoothly parametric, providing a robustness check beyond synthetic benchmarks.
+\subsection{Validation on Real-World Data (SOSD)}
+Synthetic distributions are smooth and parametric by construction, which flatters learned indexes. To test whether our conclusions survive contact with real key distributions, we repeat the identical evaluation on two SOSD~\cite{marcus2020benchmarking} datasets: \textbf{books} (Amazon book sale popularity, $11.42$M unique keys after deduplication) and \textbf{wiki\_ts} (Wikipedia edit timestamps, $3.37$M unique keys). Table~\ref{tab:sosd} reports the results.
+
+\begin{table*}[t]
+\centering
+\caption{Lookup performance on SOSD real-world datasets (5-run mean$\pm$stddev, inter-trial cache flush).}
+\label{tab:sosd}
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Dataset} & \textbf{Index} & \textbf{Memory} & \textbf{Throughput (MQPS)} & \textbf{Latency ($\mu$s)} \\
+\midrule
+\multirow{4}{*}{\textbf{books}}
+ & B+Tree & 384.66 MB & $4.00 \pm 0.65$ & $0.259$ \\
+ & RMI    & \textbf{117.98 KB} & $10.42 \pm 1.23$ & $0.097$ \\
+ & ALEX   & 250.88 MB & $\mathbf{11.08 \pm 1.78}$ & $\mathbf{0.093}$ \\
+ & LIPP   & \multicolumn{3}{c}{n/a --- see note} \\
+\midrule
+\multirow{4}{*}{\textbf{wiki\_ts}}
+ & B+Tree & 113.35 MB & $5.49 \pm 0.39$ & $0.183$ \\
+ & RMI    & \textbf{117.98 KB} & $14.08 \pm 0.59$ & $0.071$ \\
+ & ALEX   & 78.07 MB  & $15.32 \pm 0.84$ & $0.065$ \\
+ & LIPP   & 331.79 MB & $\mathbf{18.46 \pm 1.89}$ & $\mathbf{0.055}$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The real-data results confirm the synthetic findings: the RMI remains three orders of magnitude smaller than every competitor while staying within $6$--$9\%$ of ALEX's throughput. Notably, on \texttt{wiki\_ts} the RMI's fixed $118$~KB footprint is \textit{smaller than the data-dependent structures} while achieving $2.6\times$ the B+Tree's throughput. The RMI's advantage narrows on \texttt{books}, whose key distribution is less smoothly approximable---mean Stage~2 error window grows from $37$ (lognormal) to $54$ keys, widening the last-mile search.
+
+\medskip
+\noindent\textbf{Numerical robustness.} Real data exposed a precision bug that synthetic data did not. Stage~1 bucket assignment was originally computed in \texttt{float32} during training while the C++ runtime evaluates the exported weights in \texttt{float64}. On \texttt{books}, $0.015\%$ of keys ($1{,}742$ of $11.42$M) landed in a different leaf under the two precisions, so those keys were searched against a leaf whose error bound did not cover them. We fixed this by performing bucket assignment in \texttt{float64}, and additionally added a last-mile fallback that widens to a full search when a bounded window misses, so a boundary disagreement degrades throughput rather than correctness. After the fix, the observed bound-miss rate is $0$ of $500{,}000$ queries on both \texttt{books} and \texttt{wiki\_ts}.
+
+\medskip
+\noindent\textbf{Note on LIPP/\texttt{books}.} LIPP computes its node models in \texttt{long double}. On AArch64 (Apple Silicon) \texttt{long double} is 64-bit, giving a 53-bit mantissa, whereas on x86-64 it is 80-bit with a 64-bit mantissa. $83.1\%$ of \texttt{books} keys exceed $2^{53}$, and one adjacent key pair---distinct as \texttt{uint64}---collides when cast, producing a zero denominator and a non-finite model slope during bulk load. This is a platform portability limitation of the upstream implementation rather than an algorithmic result, so we report it as unavailable rather than working around it. LIPP is unaffected on \texttt{wiki\_ts}, whose keys are $O(10^9)$.
 
 \section{Related Work}
 Learned indexes were pioneered by Kraska et al.~\cite{kraska2018case}, who introduced the RMI concept. To support dynamic write operations without full retraining, researchers developed updatable learned indexes. Galakatos et al. proposed the FITing-Tree~\cite{galakatos2019fiting}, which uses linear splines with error bounds but splits leaf nodes dynamically like a B+Tree. Ding et al. developed ALEX~\cite{ding2020alex}, which uses dynamic memory slots and model retraining inside nodes. Ferragina and Vinciguerra introduced the PGM-index~\cite{ferragina2020pgm}, providing provable worst-case error bounds. Wu et al.~\cite{wu2021lipp} proposed LIPP, which further improves update performance through intelligent node splitting. Our work builds on these concepts by implementing a lightweight, decoupled LSM-style delta store~\cite{oneil1996log} combined with a CPU/GPU RMI pipeline, and extends it with drift-triggered localized retraining that monitors per-segment prediction error to selectively update only degraded model components.
