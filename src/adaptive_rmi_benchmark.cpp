@@ -1,15 +1,49 @@
+// Adaptive RMI benchmark with LSM-style merge/compaction.
+//
+// Design (rewritten to make retraining actually affect lookups):
+//   Inserts land in a delta buffer. Every window we MERGE the buffer into the
+//   searchable sorted array, which shifts the true rank (position) of keys.
+//   The Stage-1 router (key -> segment) is unchanged by a merge, but each key's
+//   true position moves, so the Stage-2 linear models and their error bounds go
+//   stale. A lookup predicts a position, searches the bounded window
+//   [pred-eps, pred+eps], and — if the key isn't there because the bound was
+//   violated — falls back to a full search (guaranteeing correctness but paying
+//   a large latency + a "bound miss").
+//
+//   Three maintenance policies decide what to refit after each merge:
+//     NEVER    — refit nothing. Bounds drift out of date; misses accumulate.
+//     PERIODIC — refit every segment every merge. Tight bounds, maximal cost.
+//     ADAPTIVE — refit only drift-flagged segments (per-segment error + KS test).
+//
+//   Per window we record read MQPS, p99 latency, bound-miss rate, and mean
+//   search-window width, so the cost of NOT maintaining the index is measured,
+//   not asserted.
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <vector>
 #include <map>
+#include <set>
 #include <chrono>
 #include <random>
 #include <cmath>
 #include <cassert>
 #include <algorithm>
 #include <numeric>
+#include <string>
 #include "drift_monitor.hpp"
+
+enum class RetrainPolicy { NEVER, PERIODIC, ADAPTIVE };
+
+static const char* policy_name(RetrainPolicy p) {
+    switch (p) {
+        case RetrainPolicy::NEVER:    return "never";
+        case RetrainPolicy::PERIODIC: return "periodic";
+        case RetrainPolicy::ADAPTIVE: return "adaptive";
+    }
+    return "unknown";
+}
 
 struct RMIParams {
     uint64_t min_key;
@@ -84,7 +118,7 @@ inline double predict_pos(uint64_t key, const RMIParams& params, uint64_t& leaf_
     return params.slopes[leaf_idx] * static_cast<double>(key) + params.intercepts[leaf_idx];
 }
 
-// Refit a single Stage 2 OLS segment from a merged set of sorted keys + positions.
+// Refit one Stage-2 OLS segment from sorted keys + their ranks (positions).
 static void refit_segment(size_t seg_id,
                           const std::vector<uint64_t>& seg_keys,
                           const std::vector<uint64_t>& seg_positions,
@@ -131,115 +165,205 @@ static void refit_segment(size_t seg_id,
     params.errors[seg_id] = max_err;
 }
 
+// Per-lookup diagnostics used to build correctness/latency metrics.
+struct LookupStat {
+    bool found;
+    bool bound_miss;    // bounded window failed -> full-search fallback
+    uint64_t window;    // elements covered by the search window this lookup used
+};
+
 class AdaptiveRMI {
 public:
     AdaptiveRMI(std::vector<uint64_t>& keys,
                 std::vector<uint64_t>& positions,
                 RMIParams& params,
-                size_t check_interval = 10000,
+                RetrainPolicy policy,
                 double error_multiplier = 1.5)
         : keys_(keys), positions_(positions), params_(params),
-          check_interval_(check_interval),
-          inserts_since_check_(0),
-          total_inserts_(0),
-          total_retrains_(0),
-          total_segments_retrained_(0),
+          policy_(policy),
+          total_inserts_(0), total_merges_(0),
+          total_retrains_(0), total_segments_retrained_(0),
           retrain_wall_clock_(0.0) {
 
         monitor_ = std::make_unique<DriftMonitor>(
             params.M, params.errors, error_multiplier);
 
-        // Build per-segment key + position lists for KS reference and refit
+        // Per-segment reference key lists (for the KS drift test).
         training_keys_per_seg_.resize(params.M);
-        training_pos_per_seg_.resize(params.M);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            uint64_t seg = predict_segment(keys[i], params);
-            training_keys_per_seg_[seg].push_back(keys[i]);
-            training_pos_per_seg_[seg].push_back(positions[i]);
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            uint64_t seg = predict_segment(keys_[i], params_);
+            training_keys_per_seg_[seg].push_back(keys_[i]);
         }
     }
 
     void insert(uint64_t key, uint64_t value) {
         delta_buffer_[key] = value;
-        inserts_since_check_++;
         total_inserts_++;
-
-        if (inserts_since_check_ >= check_interval_) {
-            run_drift_check();
-            inserts_since_check_ = 0;
-        }
     }
 
-    bool lookup(uint64_t key, uint64_t& value) {
+    // Merge the delta buffer into the sorted array and reassign ranks.
+    // The router (Stage 1) is untouched, so any staleness this introduces is
+    // exactly what a maintenance policy is responsible for repairing.
+    void merge_buffer() {
+        if (delta_buffer_.empty()) return;
+
+        std::vector<uint64_t> merged;
+        merged.reserve(keys_.size() + delta_buffer_.size());
+
+        size_t ki = 0;
+        auto it = delta_buffer_.begin();
+        while (ki < keys_.size() && it != delta_buffer_.end()) {
+            if (keys_[ki] < it->first) {
+                merged.push_back(keys_[ki++]);
+            } else if (it->first < keys_[ki]) {
+                merged.push_back((it++)->first);
+            } else {              // key already present: keep one
+                merged.push_back(keys_[ki++]);
+                ++it;
+            }
+        }
+        while (ki < keys_.size()) merged.push_back(keys_[ki++]);
+        while (it != delta_buffer_.end()) merged.push_back((it++)->first);
+
+        keys_ = std::move(merged);
+        positions_.resize(keys_.size());
+        std::iota(positions_.begin(), positions_.end(), uint64_t{0});
+        delta_buffer_.clear();
+        total_merges_++;
+    }
+
+    // Decide-and-refit for one window. Drift detection (ADAPTIVE) must run on
+    // the buffer BEFORE it is merged away, so call order in the driver is:
+    //   insert batch -> detect (here) -> merge -> refit (here).
+    // We fold both phases into maintain() to keep that contract in one place.
+    void maintain() {
+        std::vector<size_t> flagged;
+
+        if (policy_ == RetrainPolicy::NEVER) {
+            merge_buffer();
+            return;
+        } else if (policy_ == RetrainPolicy::PERIODIC) {
+            merge_buffer();
+            flagged.resize(params_.M);
+            std::iota(flagged.begin(), flagged.end(), size_t{0});
+        } else { // ADAPTIVE
+            flagged = detect_drift();     // uses buffer
+            merge_buffer();               // clears buffer
+        }
+
+        if (flagged.empty()) return;
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // One pass to bucket the (now merged) array into the flagged segments.
+        std::set<size_t> want(flagged.begin(), flagged.end());
+        std::vector<std::vector<uint64_t>> seg_keys(params_.M);
+        std::vector<std::vector<uint64_t>> seg_pos(params_.M);
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            uint64_t seg = predict_segment(keys_[i], params_);
+            if (want.count(seg)) {
+                seg_keys[seg].push_back(keys_[i]);
+                seg_pos[seg].push_back(positions_[i]);
+            }
+        }
+
+        for (size_t seg : flagged) {
+            refit_segment(seg, seg_keys[seg], seg_pos[seg], params_);
+            monitor_->update_training_error(seg, static_cast<double>(params_.errors[seg]));
+            monitor_->reset_segment_stats(seg);
+            training_keys_per_seg_[seg] = seg_keys[seg];   // refresh KS reference
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        retrain_wall_clock_ += std::chrono::duration<double>(t1 - t0).count();
+        total_retrains_++;
+        total_segments_retrained_ += flagged.size();
+        last_segments_retrained_ = flagged.size();
+    }
+
+    LookupStat lookup(uint64_t key, uint64_t& value) {
+        // Recent inserts not yet merged live in the buffer.
         auto it = delta_buffer_.find(key);
         if (it != delta_buffer_.end()) {
             value = it->second;
-            // Still probe the RMI to record prediction error for monitoring.
-            // The key is in the buffer (not in the sorted array), so the RMI
-            // prediction is "wrong" by definition — this is exactly the drift
-            // signal we want to capture.
-            uint64_t leaf_idx = 0;
-            double pred_pos = predict_pos(key, params_, leaf_idx);
-            double abs_err = std::fabs(pred_pos - static_cast<double>(keys_.size()));
-            monitor_->record_lookup_error(leaf_idx, abs_err);
-            return true;
+            return {true, false, 0};
         }
 
         uint64_t leaf_idx = 0;
         double pred_pos = predict_pos(key, params_, leaf_idx);
         uint64_t eps = params_.errors[leaf_idx];
 
-        int64_t low = static_cast<int64_t>(pred_pos) - static_cast<int64_t>(eps);
-        int64_t high = static_cast<int64_t>(pred_pos) + static_cast<int64_t>(eps);
-        if (low < 0) low = 0;
-        if (high >= static_cast<int64_t>(keys_.size())) high = keys_.size() - 1;
+        // Clamp the search window to [0, N-1] at BOTH ends, in double, before
+        // casting. Under drift a stale model can predict a position far outside
+        // the array (or overflow to inf/NaN); if low is not also clamped from
+        // above, keys_.begin()+low becomes a wild pointer past end() and the
+        // bounded search reads unmapped memory. The `!(x >= 0)` tests also
+        // reject NaN. A fully out-of-range prediction collapses to a 1-element
+        // window that misses, correctly routing the lookup to the full-search
+        // fallback below.
+        double n_minus_1 = static_cast<double>(keys_.size() - 1);
+        double lo_d = pred_pos - static_cast<double>(eps);
+        double hi_d = pred_pos + static_cast<double>(eps);
+        if (!(lo_d >= 0.0)) lo_d = 0.0;
+        if (lo_d > n_minus_1) lo_d = n_minus_1;
+        if (!(hi_d >= 0.0)) hi_d = 0.0;
+        if (hi_d > n_minus_1) hi_d = n_minus_1;
+        int64_t low = static_cast<int64_t>(lo_d);
+        int64_t high = static_cast<int64_t>(hi_d);
+        uint64_t window = static_cast<uint64_t>(high - low + 1);
 
-        auto bit = std::lower_bound(keys_.begin() + low, keys_.begin() + high + 1, key);
-        if (bit != keys_.end() && *bit == key) {
-            size_t found_idx = std::distance(keys_.begin(), bit);
-            value = positions_[found_idx];
-
-            double abs_err = std::fabs(pred_pos - static_cast<double>(found_idx));
-            monitor_->record_lookup_error(leaf_idx, abs_err);
-            return true;
+        auto begin = keys_.begin() + low;
+        auto end = keys_.begin() + high + 1;
+        auto bit = std::lower_bound(begin, end, key);
+        if (bit != end && *bit == key) {
+            size_t idx = std::distance(keys_.begin(), bit);
+            value = positions_[idx];
+            monitor_->record_lookup_error(leaf_idx, std::fabs(pred_pos - static_cast<double>(idx)));
+            return {true, false, window};
         }
-        return false;
+
+        // Bound violated -> full search. Correct, but O(N)-wide: a bound miss.
+        auto fit = std::lower_bound(keys_.begin(), keys_.end(), key);
+        if (fit != keys_.end() && *fit == key) {
+            size_t idx = std::distance(keys_.begin(), fit);
+            value = positions_[idx];
+            monitor_->record_lookup_error(leaf_idx, std::fabs(pred_pos - static_cast<double>(idx)));
+            return {true, true, static_cast<uint64_t>(keys_.size())};
+        }
+        return {false, true, static_cast<uint64_t>(keys_.size())};
     }
 
+    size_t array_size() const { return keys_.size(); }
     size_t buffer_size() const { return delta_buffer_.size(); }
-
-    // Summary stats
     size_t total_inserts() const { return total_inserts_; }
+    size_t total_merges() const { return total_merges_; }
     size_t total_retrains() const { return total_retrains_; }
     size_t total_segments_retrained() const { return total_segments_retrained_; }
+    size_t last_segments_retrained() const { return last_segments_retrained_; }
     double retrain_wall_clock() const { return retrain_wall_clock_; }
-
-    const std::vector<std::string>& retrain_log() const { return retrain_csv_lines_; }
 
 private:
     std::vector<uint64_t>& keys_;
     std::vector<uint64_t>& positions_;
     RMIParams& params_;
+    RetrainPolicy policy_;
     std::map<uint64_t, uint64_t> delta_buffer_;
     std::unique_ptr<DriftMonitor> monitor_;
     std::vector<std::vector<uint64_t>> training_keys_per_seg_;
-    std::vector<std::vector<uint64_t>> training_pos_per_seg_;
 
-    size_t check_interval_;
-    size_t inserts_since_check_;
     size_t total_inserts_;
+    size_t total_merges_;
     size_t total_retrains_;
     size_t total_segments_retrained_;
+    size_t last_segments_retrained_ = 0;
     double retrain_wall_clock_;
-    std::vector<std::string> retrain_csv_lines_;
 
-    void run_drift_check() {
-        // Build segment assignments for buffer keys
+    std::vector<size_t> detect_drift() {
         std::vector<std::pair<size_t, uint64_t>> buffer_seg_assignments;
         buffer_seg_assignments.reserve(delta_buffer_.size());
         for (auto& [key, val] : delta_buffer_) {
-            uint64_t seg = predict_segment(key, params_);
-            buffer_seg_assignments.emplace_back(seg, key);
+            (void)val;
+            buffer_seg_assignments.emplace_back(predict_segment(key, params_), key);
         }
 
         auto hot = monitor_->segments_needing_retrain(
@@ -247,72 +371,16 @@ private:
             params_.slopes, params_.intercepts, params_.errors,
             buffer_seg_assignments);
 
-        if (hot.empty()) return;
-
-        // Check if >50% segments are hot → flag full retrain recommended
-        bool full_retrain_flag = hot.size() > params_.M / 2;
-
-        auto retrain_start = std::chrono::high_resolution_clock::now();
-
-        for (auto& event : hot) {
-            size_t seg = event.segment_id;
-
-            // Merge training keys/positions + buffer keys for this segment
-            std::vector<uint64_t> merged_keys = training_keys_per_seg_[seg];
-            std::vector<uint64_t> merged_positions = training_pos_per_seg_[seg];
-
-            for (auto& [bk, bv] : delta_buffer_) {
-                uint64_t bs = predict_segment(bk, params_);
-                if (bs == seg) {
-                    merged_keys.push_back(bk);
-                    merged_positions.push_back(bv);
-                }
-            }
-
-            // Sort merged keys and positions together
-            std::vector<size_t> order(merged_keys.size());
-            std::iota(order.begin(), order.end(), 0);
-            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-                return merged_keys[a] < merged_keys[b];
-            });
-            std::vector<uint64_t> sorted_keys(merged_keys.size());
-            std::vector<uint64_t> sorted_pos(merged_keys.size());
-            for (size_t i = 0; i < order.size(); ++i) {
-                sorted_keys[i] = merged_keys[order[i]];
-                sorted_pos[i] = merged_positions[order[i]];
-            }
-
-            double err_before = static_cast<double>(params_.errors[seg]);
-            refit_segment(seg, sorted_keys, sorted_pos, params_);
-            double err_after = static_cast<double>(params_.errors[seg]);
-
-            monitor_->update_training_error(seg, err_after);
-            monitor_->reset_segment_stats(seg);
-
-            // Update training keys and positions for this segment
-            training_keys_per_seg_[seg] = sorted_keys;
-            training_pos_per_seg_[seg] = sorted_pos;
-
-            // CSV log line
-            std::ostringstream line;
-            line << total_inserts_ << "," << seg << ","
-                 << err_before << "," << err_after << ","
-                 << (event.ks_triggered ? "true" : "false") << ","
-                 << (event.error_triggered ? "true" : "false") << ","
-                 << (full_retrain_flag ? "true" : "false");
-            retrain_csv_lines_.push_back(line.str());
-        }
-
-        auto retrain_end = std::chrono::high_resolution_clock::now();
-        double elapsed = std::chrono::duration<double>(retrain_end - retrain_start).count();
-        retrain_wall_clock_ += elapsed;
-        total_retrains_++;
-        total_segments_retrained_ += hot.size();
+        std::vector<size_t> flagged;
+        flagged.reserve(hot.size());
+        for (auto& e : hot) flagged.push_back(e.segment_id);
+        return flagged;
     }
 };
 
-// Generate insert keys that simulate distribution drift:
-// first half from the original key range, second half shifted right.
+// Drifting insert workload: first half within the original key range, second
+// half shifted beyond max_key — a genuine covariate shift the router did not
+// see at training time.
 static std::vector<uint64_t> generate_drifting_inserts(
     uint64_t min_key, uint64_t max_key, size_t count, uint64_t seed) {
     std::mt19937_64 gen(seed);
@@ -321,39 +389,59 @@ static std::vector<uint64_t> generate_drifting_inserts(
     inserts.reserve(count);
 
     size_t half = count / 2;
-
-    // First half: keys within the original range (minor drift)
     std::uniform_int_distribution<uint64_t> in_range(min_key, max_key);
-    for (size_t i = 0; i < half; ++i) {
-        inserts.push_back(in_range(gen));
-    }
+    for (size_t i = 0; i < half; ++i) inserts.push_back(in_range(gen));
 
-    // Second half: keys shifted right — genuine covariate shift
     uint64_t shift = range / 2;
     std::uniform_int_distribution<uint64_t> shifted(max_key, max_key + shift);
-    for (size_t i = half; i < count; ++i) {
-        inserts.push_back(shifted(gen));
-    }
+    for (size_t i = half; i < count; ++i) inserts.push_back(shifted(gen));
 
     return inserts;
 }
 
+static double percentile(std::vector<double>& v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    double rank = p / 100.0 * (v.size() - 1);
+    size_t lo = static_cast<size_t>(std::floor(rank));
+    size_t hi = static_cast<size_t>(std::ceil(rank));
+    if (lo == hi) return v[lo];
+    double frac = rank - lo;
+    return v[lo] * (1.0 - frac) + v[hi] * frac;
+}
+
 int main(int argc, char* argv[]) {
     std::string data_dir = "data";
-    if (argc > 1) data_dir = argv[1];
+    if (argc > 1 && argv[1][0] != '-') data_dir = argv[1];
 
-    std::string keys_path   = data_dir + "/keys.bin";
-    std::string pos_path    = data_dir + "/positions.bin";
-    std::string params_path = data_dir + "/rmi_params.bin";
+    size_t num_inserts = 200000;
+    size_t check_interval = 10000;
+    double error_multiplier = 1.5;
+    size_t num_reads_per_window = 10000;
+    RetrainPolicy policy = RetrainPolicy::ADAPTIVE;
 
-    std::vector<uint64_t> keys;
-    std::vector<uint64_t> positions;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--inserts" && i + 1 < argc) num_inserts = std::stoull(argv[++i]);
+        else if (arg == "--interval" && i + 1 < argc) check_interval = std::stoull(argv[++i]);
+        else if (arg == "--alpha" && i + 1 < argc) error_multiplier = std::stod(argv[++i]);
+        else if (arg == "--reads" && i + 1 < argc) num_reads_per_window = std::stoull(argv[++i]);
+        else if (arg == "--policy" && i + 1 < argc) {
+            std::string p = argv[++i];
+            if (p == "never") policy = RetrainPolicy::NEVER;
+            else if (p == "periodic") policy = RetrainPolicy::PERIODIC;
+            else if (p == "adaptive") policy = RetrainPolicy::ADAPTIVE;
+            else { std::cerr << "Unknown policy: " << p << std::endl; return 1; }
+        }
+    }
+
+    std::vector<uint64_t> keys, positions;
     RMIParams params;
 
     std::cout << "Loading dataset from: " << data_dir << std::endl;
-    if (!load_binary_file(keys_path, keys) ||
-        !load_binary_file(pos_path, positions) ||
-        !load_rmi_params(params_path, params)) {
+    if (!load_binary_file(data_dir + "/keys.bin", keys) ||
+        !load_binary_file(data_dir + "/positions.bin", positions) ||
+        !load_rmi_params(data_dir + "/rmi_params.bin", params)) {
         std::cerr << "Error: Could not load data files from: " << data_dir << std::endl;
         return 1;
     }
@@ -361,112 +449,104 @@ int main(int argc, char* argv[]) {
     size_t N = keys.size();
     std::cout << "Loaded " << N << " keys, M=" << params.M << " segments." << std::endl;
 
-    // Configuration — CLI overrides or defaults
-    size_t num_inserts = 200000;
-    size_t check_interval = 10000;
-    double error_multiplier = 1.5;
-    size_t num_reads_per_window = 10000;
-
-    // Parse optional flags: --inserts N --interval N --alpha F
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--inserts" && i + 1 < argc) num_inserts = std::stoull(argv[++i]);
-        else if (arg == "--interval" && i + 1 < argc) check_interval = std::stoull(argv[++i]);
-        else if (arg == "--alpha" && i + 1 < argc) error_multiplier = std::stod(argv[++i]);
-    }
-
-    AdaptiveRMI index(keys, positions, params, check_interval, error_multiplier);
-
-    // Generate drifting insert workload
+    AdaptiveRMI index(keys, positions, params, policy, error_multiplier);
     auto insert_keys = generate_drifting_inserts(
         params.min_key, params.max_key, num_inserts, 42);
 
     std::cout << "\n==========================================================" << std::endl;
-    std::cout << "  Adaptive RMI Benchmark (Drift-Triggered Localized Retrain)" << std::endl;
+    std::cout << "  Adaptive RMI Benchmark (merge/compaction + maintenance)" << std::endl;
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  Inserts: " << num_inserts << std::endl;
-    std::cout << "  Check interval: " << check_interval << std::endl;
-    std::cout << "  Error multiplier (alpha): " << error_multiplier << std::endl;
+    std::cout << "  Policy: " << policy_name(policy) << std::endl;
+    std::cout << "  Inserts: " << num_inserts << ", interval: " << check_interval
+              << ", alpha: " << error_multiplier << std::endl;
 
-    // Interleaved insert + read workload
     std::mt19937 gen(123);
-    std::uniform_int_distribution<size_t> key_dis(0, N - 1);
-
     size_t windows = num_inserts / check_interval;
 
-    std::cout << "\nWindow | Inserts | Buffer | Reads MQPS | Retrains | Segs Retrained" << std::endl;
-    std::cout << "-------|---------|--------|------------|----------|---------------" << std::endl;
+    std::cout << "\nWin | ArraySize | MQPS | p99(us) | BoundMiss% | MeanWin | SegsRetr" << std::endl;
+    std::cout << "----|-----------|------|---------|------------|---------|---------" << std::endl;
+
+    // Per-window CSV for the evaluation driver / plots.
+    std::string win_csv = data_dir + "/adaptive_windows_" + policy_name(policy) + ".csv";
+    std::ofstream wc(win_csv);
+    wc << "window,array_size,mqps,p99_us,bound_miss_pct,mean_window,segs_retrained\n";
 
     for (size_t w = 0; w < windows; ++w) {
         size_t ins_start = w * check_interval;
-        size_t ins_end = ins_start + check_interval;
+        size_t ins_end = std::min(ins_start + check_interval, num_inserts);
 
-        size_t retrains_before = index.total_retrains();
-        size_t segs_before = index.total_segments_retrained();
+        for (size_t i = ins_start; i < ins_end; ++i)
+            index.insert(insert_keys[i], N + i);   // value = synthetic rank tag
 
-        // Insert batch
-        for (size_t i = ins_start; i < ins_end && i < num_inserts; ++i) {
-            index.insert(insert_keys[i], i);
-        }
+        // Merge + policy-driven maintenance for this window.
+        index.maintain();
 
-        // Read throughput measurement
-        // Mix: 80% existing keys (correctness-checked), 20% insert keys
-        // (exercises drifted segments so DriftMonitor records errors).
-        auto read_start = std::chrono::high_resolution_clock::now();
+        // Read workload: half over the whole array (background), half over the
+        // already-merged insert keys (the drifted hot set) so a stale model's
+        // degradation is actually exercised rather than diluted.
+        std::vector<double> latencies_us;
+        latencies_us.reserve(num_reads_per_window);
+        size_t bound_misses = 0;
+        double window_sum = 0.0;
+        size_t merged_inserts = ins_end;   // all inserted so far are merged
+
         for (size_t i = 0; i < num_reads_per_window; ++i) {
-            uint64_t val = 0;
-            if (i % 5 == 0 && ins_end > 0) {
-                size_t buf_idx = gen() % ins_end;
-                uint64_t target = insert_keys[buf_idx];
-                index.lookup(target, val);
+            uint64_t target;
+            if (i % 2 == 0 && merged_inserts > 0) {
+                target = insert_keys[gen() % merged_inserts];
             } else {
-                size_t idx = key_dis(gen);
-                uint64_t target = keys[idx];
-                bool found = index.lookup(target, val);
-                assert(found);
+                target = keys[gen() % keys.size()];
             }
+
+            uint64_t val = 0;
+            auto q0 = std::chrono::high_resolution_clock::now();
+            LookupStat st = index.lookup(target, val);
+            auto q1 = std::chrono::high_resolution_clock::now();
+
+            assert(st.found);
+            latencies_us.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
+            if (st.bound_miss) ++bound_misses;
+            window_sum += static_cast<double>(st.window);
         }
-        auto read_end = std::chrono::high_resolution_clock::now();
 
-        double read_time = std::chrono::duration<double>(read_end - read_start).count();
-        double mqps = (static_cast<double>(num_reads_per_window) / read_time) / 1e6;
+        double total_us = std::accumulate(latencies_us.begin(), latencies_us.end(), 0.0);
+        double mqps = (static_cast<double>(num_reads_per_window) / (total_us / 1e6)) / 1e6;
+        double p99 = percentile(latencies_us, 99.0);
+        double miss_pct = 100.0 * bound_misses / num_reads_per_window;
+        double mean_win = window_sum / num_reads_per_window;
 
-        std::cout << "  " << (w + 1) << "    | " << (ins_end) << "   | "
-                  << index.buffer_size() << "  | "
-                  << mqps << "   | "
-                  << (index.total_retrains() - retrains_before) << "        | "
-                  << (index.total_segments_retrained() - segs_before) << std::endl;
+        std::cout << "  " << (w + 1) << " | " << index.array_size()
+                  << " | " << mqps << " | " << p99
+                  << " | " << miss_pct << " | " << mean_win
+                  << " | " << index.last_segments_retrained() << std::endl;
+
+        wc << (w + 1) << "," << index.array_size() << "," << mqps << ","
+           << p99 << "," << miss_pct << "," << mean_win << ","
+           << index.last_segments_retrained() << "\n";
     }
+    wc.close();
 
     std::cout << "\n==========================================================" << std::endl;
-    std::cout << "  Summary" << std::endl;
+    std::cout << "  Summary (" << policy_name(policy) << ")" << std::endl;
     std::cout << "==========================================================" << std::endl;
     std::cout << "  Total inserts:            " << index.total_inserts() << std::endl;
+    std::cout << "  Total merges:             " << index.total_merges() << std::endl;
     std::cout << "  Total retrain events:     " << index.total_retrains() << std::endl;
     std::cout << "  Total segments retrained: " << index.total_segments_retrained() << std::endl;
     std::cout << "  Retrain wall-clock (s):   " << index.retrain_wall_clock() << std::endl;
-    std::cout << "  Final buffer size:        " << index.buffer_size() << std::endl;
+    std::cout << "  Final array size:         " << index.array_size() << std::endl;
+    std::cout << "  Per-window CSV:           " << win_csv << std::endl;
 
-    // Write retrain log CSV
-    std::string csv_path = data_dir + "/adaptive_rmi_retrains.csv";
-    std::ofstream csv(csv_path);
-    if (csv) {
-        csv << "insert_count,segment_id,error_before,error_after,ks_triggered,error_triggered,full_retrain_recommended\n";
-        for (auto& line : index.retrain_log()) {
-            csv << line << "\n";
-        }
-        std::cout << "  Retrain log written to: " << csv_path << std::endl;
-    }
-
-    // Write summary results
-    std::string results_path = data_dir + "/adaptive_rmi_results.txt";
+    std::string results_path = data_dir + "/adaptive_rmi_results_" + policy_name(policy) + ".txt";
     std::ofstream out(results_path);
     if (out) {
+        out << "policy: " << policy_name(policy) << "\n";
         out << "total_inserts: " << index.total_inserts() << "\n";
+        out << "total_merges: " << index.total_merges() << "\n";
         out << "total_retrain_events: " << index.total_retrains() << "\n";
         out << "total_segments_retrained: " << index.total_segments_retrained() << "\n";
         out << "retrain_wall_clock_s: " << index.retrain_wall_clock() << "\n";
-        out << "buffer_size_final: " << index.buffer_size() << "\n";
+        out << "array_size_final: " << index.array_size() << "\n";
     }
 
     std::cout << "==========================================================" << std::endl;

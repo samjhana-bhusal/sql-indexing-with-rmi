@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Hybrid Learned Index (RMI) vs. B+Tree: Memory-Compute Trade-offs with LSM-style Dynamic Write Buffers"
+authors:
+  - name: "Anonymous"
+repository-code: "https://github.com/PLACEHOLDER"
+license: MIT
+keywords:
+  - learned-indexes
+  - recursive-model-index
+  - b-plus-tree
+  - database-systems
+  - drift-detection

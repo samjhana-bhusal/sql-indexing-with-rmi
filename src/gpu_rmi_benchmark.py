@@ -180,36 +180,46 @@ def main():
         for bs, tp in results.items():
             f.write(f"batch_{bs}: {tp}\n")
             
+    bs_list = list(results.keys())
+    tp_list = list(results.values())
+    std_list = [results_std.get(bs, 0.0) for bs in bs_list]
+    mem_list = [gpu_mem_usage.get(bs, 0) for bs in bs_list]
+
+    # Persist the raw sweep so the figure can be regenerated without re-running
+    # (src/plot_gpu_sweep.py reads this).
+    csv_path = os.path.join(args.out_dir, "gpu_sweep.csv")
+    with open(csv_path, "w") as f:
+        f.write("batch,mqps,std,mem_mb\n")
+        for bs, tp, sd, mm in zip(bs_list, tp_list, std_list, mem_list):
+            f.write(f"{bs},{tp:.4f},{sd:.4f},{mm:.1f}\n")
+
     try:
         import matplotlib.pyplot as plt
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
-                                        gridspec_kw={'height_ratios': [2, 1]})
-
-        bs_list = list(results.keys())
-        tp_list = list(results.values())
-        mem_list = [gpu_mem_usage.get(bs, 0) for bs in bs_list]
-
-        ax1.plot(bs_list, tp_list, marker='o', linewidth=2, color='#1f77b4')
-        ax1.set_ylabel('Throughput (MQPS)', fontsize=12)
-        ax1.set_title('GPU Dispatch Cost: Break-Even Batch Size vs. CPU RMI', fontsize=13)
-        ax1.grid(True, which="both", ls="--", alpha=0.5)
-
-        # Mark CPU RMI throughput as a horizontal reference
-        ax1.axhline(y=11.07, color='#d62728', linestyle='--', linewidth=1.5, label='CPU RMI (11.07 MQPS)')
-        ax1.legend(fontsize=10)
-
-        ax2.bar(range(len(bs_list)), mem_list, color='#ff7f0e', alpha=0.7)
-        ax2.set_xticks(range(len(bs_list)))
-        ax2.set_xticklabels([str(bs) for bs in bs_list], rotation=45, fontsize=9)
-        ax2.set_xlabel('Batch Size', fontsize=12)
-        ax2.set_ylabel('GPU Mem (MB)', fontsize=12)
-        ax2.grid(True, axis='y', ls="--", alpha=0.5)
+        # Single panel: GPU memory is essentially constant across the sweep, so
+        # it is reported in text rather than given its own (flat) panel. Log2 x
+        # so the geometric batch-size sweep is evenly spaced.
+        fig, ax = plt.subplots(figsize=(7.5, 4.2))
+        ax.errorbar(bs_list, tp_list, yerr=std_list, marker='o', linewidth=2,
+                    capsize=3, color='#1f77b4',
+                    label='GPU (MPS), 5-run mean $\\pm$ stddev')
+        ax.axhline(y=11.07, color='#d62728', linestyle='--', linewidth=1.5,
+                   label='CPU RMI (11.07 MQPS)')
+        ax.set_xscale('log', base=2)
+        ax.set_xticks(bs_list)
+        ax.set_xticklabels([str(bs) for bs in bs_list], rotation=45, fontsize=9)
+        ax.set_xlabel('Batch size (log$_2$ scale)', fontsize=12)
+        ax.set_ylabel('Throughput (MQPS)', fontsize=12)
+        ax.set_title('GPU Dispatch Cost: Break-Even Batch Size vs. CPU RMI', fontsize=12)
+        ax.grid(True, which="both", ls="--", alpha=0.4)
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=10, loc='upper left')
 
         plt.tight_layout()
         plot_path = os.path.join(args.out_dir, "gpu_throughput.png")
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"\nPlot saved to {plot_path}.")
+        plt.savefig(plot_path, dpi=200, bbox_inches='tight')
+        print(f"\nPlot saved to {plot_path}. "
+              f"GPU mem across sweep: {min(mem_list):.1f}-{max(mem_list):.1f} MB")
     except Exception as e:
         print(f"\nCould not generate plot: {e}")
 

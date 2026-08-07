@@ -51,8 +51,11 @@ echo -e "\n--> Running CPU RMI Benchmark..."
 echo -e "\n--> Running Dynamic Read-Write (Delta-Buffered) RMI Benchmark..."
 ./buffered_rmi_benchmark "$RUN_DIR"
 
-echo -e "\n--> Running Adaptive RMI Benchmark (Drift-Triggered Retrain)..."
-./adaptive_rmi_benchmark "$RUN_DIR"
+echo -e "\n--> Running Maintenance-Policy Benchmarks (merge/compaction)..."
+for POLICY in never periodic adaptive; do
+    echo "    policy=$POLICY"
+    ./adaptive_rmi_benchmark "$RUN_DIR" --policy "$POLICY" --inserts 200000 --interval 10000
+done
 
 echo -e "\n--> Running ALEX Baseline Benchmark..."
 ./alex_benchmark "$RUN_DIR"

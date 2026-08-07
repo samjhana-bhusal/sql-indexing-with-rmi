@@ -73,24 +73,40 @@ The real finding is the **break-even batch size**: you need 8,192 concurrent loo
 
 > ⚠️ **This result was previously reported incorrectly.** The earlier version synchronized only on CUDA (`if device.type == 'cuda': torch.cuda.synchronize()`), so on MPS the timer measured *queue-submission* time, not execution time — understating GPU throughput ~4× at large batches and producing a bogus "GPU always loses by 4.1×" conclusion. Fixed with an explicit `torch.mps.synchronize()` inside the timed region.
 
-### 4. Adaptive Retraining (Drift-Triggered)
+### 4. Maintenance Under Drift (merge/compaction)
 
-The delta buffer defers insert cost but the static RMI's accuracy degrades as
-key distributions shift. Our **drift-triggered localized retraining** monitors
-per-segment prediction error and a two-sample KS test (ported from
-[proj2/Drift-Lab](../proj2)), selectively refitting only degraded Stage 2 leaf
-models.
+The delta buffer defers insert cost, but a buffer must eventually be **merged**
+into the sorted array — and the moment it is, every key's rank shifts and the
+Stage 2 models go stale, so bounded searches miss and fall back to full search.
+This is the mechanism by which an unmaintained learned index decays. We compare
+three maintenance policies on a drifting merge workload (N=1M, M=500, 200k
+inserts over 20 merges; 5-trial mean ± stddev):
 
-| Config | MQPS | Segments Retrained | Retrain Cost (s) |
-|---|---|---|---|
-| A — Never retrain | 8.04 ± 0.26 | 26 | 0.025 ± 0.003 |
-| B — Periodic retrain | 4.00 ± 0.15 | 4501 | 3.557 ± 0.047 |
-| C — **Adaptive retrain** | 4.44 ± 0.34 | 583 | **0.211 ± 0.010** |
+| Policy | MQPS | p99 (μs) | Bound-miss % | Segs Retrained |
+|---|---|---|---|---|
+| Never retrain | 7.09 ± 0.25 | 0.499 ± 0.018 | **99.76** | 0 |
+| Periodic retrain | **9.09 ± 0.12** | **0.368 ± 0.017** | 0.00 | 10,000 |
+| Adaptive retrain | 8.73 ± 0.39 | 0.396 ± 0.035 | 27.56 ± 1.45 | 2,455 ± 5 |
 
-Adaptive retraining retrained 13% of the segments periodic did, at **5.9% of
-the wall-clock cost**, while delivering 11% higher read throughput.
+**Maintenance is not optional.** Under drift, never-retrain falls back to a full
+search on **99.76%** of lookups — making it both the least accurate *and the
+slowest* policy (7.09 vs 9.09 MQPS): the fallbacks cost more than the maintenance
+they avoid. A static learned index is not viable once the data moves.
 
-![Adaptive vs Periodic](report/adaptive_vs_periodic.png)
+**Selective vs full.** Adaptive reaches **96% of periodic's throughput** while
+refitting only **24.6% as many segments**. It does *not* match periodic's
+correctness (27.6% vs 0% bound-miss) — that gap is a one-window detection lag,
+visible as oscillation in the figure. Adaptive is an intermediate point on a
+cost–quality trade-off, not a strict win over periodic. (The error-ratio α is a
+weak cost lever; the KS distributional trigger dominates retrains under genuine
+covariate shift.)
+
+> **Note:** an earlier version of this table reported never-retrain *winning*
+> on throughput, because the old benchmark never merged the buffer — so
+> retraining couldn't affect any lookup. The merge/compaction rearchitecture
+> fixes that: retraining now measurably matters.
+
+![Maintenance policies under drift](report/adaptive_vs_periodic.png)
 
 ## Visualizations
 
@@ -146,7 +162,7 @@ proj1/
 │   ├── train_rmi.py                 # PyTorch Stage 1 NN + OLS Stage 2
 │   ├── data_prep.py                 # Synthetic + SOSD data generation
 │   ├── gpu_rmi_benchmark.py         # GPU batch-size sensitivity sweep
-│   ├── adaptive_evaluation.py       # 3-config A/B/C eval driver
+│   ├── adaptive_evaluation.py       # never/periodic/adaptive policy eval driver
 │   └── parameter_sweep.py           # M-sweep analysis
 └── external/
     ├── alex/              # Microsoft ALEX (header-only, ARM-patched)

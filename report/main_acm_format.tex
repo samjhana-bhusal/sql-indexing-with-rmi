@@ -1,31 +1,63 @@
-\documentclass[10pt,twocolumn,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[margin=0.75in]{geometry}
-\usepackage{amsmath}
-\usepackage{amssymb}
-\usepackage{graphicx}
-\usepackage{booktabs}
+\documentclass[sigconf,nonacm]{acmart}
+%% For double-blind review submission, use instead:
+%% \documentclass[sigconf,anonymous,review,nonacm]{acmart}
+
 \usepackage{multirow}
-\usepackage{cite}
-\usepackage{microtype}
-\usepackage{url}
 
-\title{\textbf{Evaluating the Memory-Compute Trade-offs of Learned Index Structures with LSM-style Dynamic Write Buffers}}
-
-\author{
-    \textit{Systems, Databases, and Computer Architecture Track}
-}
-\date{\today}
+%% ACM boilerplate: set these to the venue's values before camera-ready
+\setcopyright{none}          % workshop preprint; set per CFP for camera-ready
+\acmConference[aiDM '27]{Workshop on Exploiting Artificial Intelligence Techniques for Data Management}{June 2027}{Location, Country}
+\acmYear{2027}
+\settopmatter{printacmref=false} % suppress the ACM ref block for a preprint
+\renewcommand\footnotetextcopyrightpermission[1]{} % drop the copyright footer
 
 \begin{document}
 
-\maketitle
+\title{Evaluating the Memory--Compute Trade-offs of Learned Index Structures with LSM-style Dynamic Write Buffers and Drift-Triggered Maintenance}
+
+\author{Author Name}
+\affiliation{%
+  \institution{Institution}
+  \city{City}
+  \country{Country}}
+\email{author@example.edu}
 
 \begin{abstract}
 Traditional database indexes, primarily B+Trees, suffer from significant latency overheads and high cache miss rates due to pointer-chasing in memory-bound architectures. The emerging paradigm of Learned Indexes addresses this by treating the indexing problem as a Cumulative Distribution Function (CDF) prediction task, replacing tree traversal with numerical model execution. However, static learned indexes like the Recursive Model Index (RMI) do not natively support dynamic insertions without expensive retraining. 
 
 In this work, we present a hybrid C++/Python execution pipeline comparing a degree-optimized ($B=64$) C++ B+Tree against a two-stage CPU/GPU RMI. To address the dynamic update bottleneck, we implement an LSM-style Delta Buffer (Write-Ahead Store) integrated with our RMI. Our experiments show that the RMI achieves a 99.97\% memory footprint compression (117.9~KB vs. 334.7~MB) and significantly lowers latency compared to the B+Tree under continuous distributions. We evaluate RMI sensitivity across uniform, log-normal, and clustered key distributions, including a drifting workload where the key distribution shifts over time. We demonstrate how our dynamic write buffer maintains low-latency lookups ($<0.11\,\mu$s) while supporting real-time inserts. Using a merge-based workload in which the delta buffer is periodically compacted into the sorted array (so that an unmaintained model genuinely decays), we show that a never-retrained learned index is not viable under drift: its lookups fall back to a full search $99.8\%$ of the time, making it both the least accurate \textit{and} the slowest policy. We then introduce a \textit{drift-triggered adaptive retraining} mechanism that monitors per-segment prediction error and key distribution and selectively refits only degraded Stage~2 leaf models, reaching $96\%$ of full periodic-retraining throughput while refitting only $24.6\%$ as many segments.
 \end{abstract}
+
+%% CCS concepts — regenerate from https://dl.acm.org/ccs if the venue requires
+%% an exact match; the block below is a reasonable, valid default.
+\begin{CCSXML}
+<ccs2012>
+   <concept>
+       <concept_id>10002951.10002952.10003190.10003195</concept_id>
+       <concept_desc>Information systems~Point lookups</concept_desc>
+       <concept_significance>500</concept_significance>
+       </concept>
+   <concept>
+       <concept_id>10002951.10002952.10003190</concept_id>
+       <concept_desc>Information systems~Data structures</concept_desc>
+       <concept_significance>300</concept_significance>
+       </concept>
+   <concept>
+       <concept_id>10010147.10010257</concept_id>
+       <concept_desc>Computing methodologies~Machine learning</concept_desc>
+       <concept_significance>300</concept_significance>
+       </concept>
+ </ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Information systems~Point lookups}
+\ccsdesc[300]{Information systems~Data structures}
+\ccsdesc[300]{Computing methodologies~Machine learning}
+
+\keywords{learned index, recursive model index, B+Tree, LSM-tree,
+concept drift, adaptive retraining, index maintenance}
+
+\maketitle
 
 \section{Introduction}
 Modern computer systems are increasingly constrained by the ``Memory Wall'': the growing performance gap between fast CPU core executions and slow DRAM data fetches~\cite{wulf1995hitting, hennessy2011computer}. In relational database storage engines, index lookups represent a critical bottleneck. The ubiquitous B+Tree index~\cite{comer1979ubiquitous} navigates sorted datasets by traversing child node pointers, resulting in multiple random memory accesses. Because these heap-allocated nodes are rarely aligned in cache lines, B+Tree lookups trigger significant L1/L2 data cache misses and cause CPU pipeline stalls.
@@ -325,7 +357,7 @@ The real-data results confirm the synthetic findings: the RMI remains three orde
 \section{Conclusion}
 This project evaluates the performance and architectural trade-offs of learned index structures, benchmarked against both traditional B+Trees and state-of-the-art updatable learned indexes (ALEX, LIPP). Our hybrid C++/Python RMI demonstrates a 99.97\% memory reduction over a degree-optimized B+Tree, fitting within CPU caches to avoid pointer-chasing latency. By incorporating an LSM-style Delta Buffer with periodic merge/compaction, we resolve the static training limitation of RMIs. Our merge-based evaluation shows that maintenance is not optional under drift (a never-retrained index falls back to full search on $99.8\%$ of lookups) and that drift-triggered adaptive retraining recovers $96\%$ of full periodic-retraining throughput while refitting only $24.6\%$ as many segments, occupying an intermediate point on the cost--quality frontier. The inclusion of ALEX and LIPP baselines contextualizes these results: while natively updatable learned indexes achieve higher raw throughput (LIPP at $22.74$ MQPS vs.\ RMI at $11.07$ MQPS), they require $218$--$710$~MB of memory compared to the RMI's $118$~KB, a three-order-of-magnitude advantage that makes the RMI uniquely suited for memory-constrained deployments. Together, these components deliver a high-performance, write-capable, self-maintaining learned index suitable for modern storage engines, validated on both synthetic and real-world (SOSD) datasets.
 
-\bibliographystyle{IEEEtran}
+\bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
 \end{document}
